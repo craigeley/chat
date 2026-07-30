@@ -78,7 +78,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     // The address book is small (hundreds of contacts) and changes rarely, so we
     // fetch it once per session alongside the first conversation load and cache it.
-    private var contacts = Contacts()
+    // Seeded from the persisted index so names resolve immediately on launch and
+    // survive a session where the fetch never succeeds.
+    private var contacts = Store.contacts(application)
     private var contactList = emptyList<Contact>()
     private var contactsLoaded = false
 
@@ -196,6 +198,13 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 ?.privateApiReady ?: _state.value.privateApi
             if (!contactsLoaded) {
                 runCatching { client.contacts() }.onSuccess { raw ->
+                    // A server that can't read the Mac's address book (seen after a
+                    // BlueBubbles restart when its contacts access came up broken)
+                    // answers with nothing. Treat that like a failed load: keep the
+                    // seeded index rather than overwriting the persisted one with
+                    // an empty map, and leave contactsLoaded false so a later
+                    // refresh retries.
+                    if (raw.isEmpty() && contacts.asMap().isNotEmpty()) return@onSuccess
                     contacts = Contacts.from(raw)
                     // Persist so SocketService can name notification senders even
                     // when the app (and this ViewModel) isn't running.
