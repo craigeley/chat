@@ -24,6 +24,8 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
@@ -53,6 +55,19 @@ import kotlinx.coroutines.launch
 @Composable
 fun ConversationsScreen(viewModel: ChatViewModel, onOpenSettings: () -> Unit, onNewMessage: () -> Unit) {
     val state by viewModel.state.collectAsState()
+    val listState = rememberLazyListState()
+
+    // The list is keyed by guid, so LazyListState anchors to the first *visible*
+    // row's key — a refresh that inserts a new chat above it (e.g. one just started
+    // from New) slides the viewport down with the old top row, leaving the new chat
+    // off-screen above. Snap back to the top when the top chat changes, but only if
+    // the user is already up there (don't yank them out of a scrolled-down read).
+    val topGuid = state.conversations.firstOrNull()?.guid
+    LaunchedEffect(topGuid) {
+        if (topGuid != null && listState.firstVisibleItemIndex <= 1) {
+            listState.scrollToItem(0)
+        }
+    }
 
     Column(modifier = Modifier.fillMaxSize().padding(horizontal = 20.dp)) {
         Row(
@@ -103,7 +118,7 @@ fun ConversationsScreen(viewModel: ChatViewModel, onOpenSettings: () -> Unit, on
                     )
                 }
             }
-            else -> LazyColumn(modifier = Modifier.weight(1f).fillMaxWidth()) {
+            else -> LazyColumn(state = listState, modifier = Modifier.weight(1f).fillMaxWidth()) {
                 items(state.conversations, key = { it.guid }) { convo ->
                     // A tapback as the newest activity shows as "Liz loved an image";
                     // otherwise the real message text, prefixed "You: " when it's ours.
