@@ -64,6 +64,17 @@
                 android:name="android.support.FILE_PROVIDER_PATHS"
                 android:resource="@xml/file_paths" />
         </provider>
+        <receiver
+            android:name=".LightSdkMarkerReceiver"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.thelightphone.sdk.ACTION_SDK_MARKER" />
+            </intent-filter>
+            <meta-data
+                android:name="com.thelightphone.sdk.SDK_VERSION"
+                android:value="0.1.0" />
+        </receiver>
     </application>
 
 </manifest>
