@@ -256,6 +256,19 @@ clears the password and returns to setup.
     For the preview the sweep prefers the newest **non-reaction** message (so a row
     reads "So you'll watch…" not a bare "Loved …"), while still bumping recency by
     the newest message's date — a tapback bumps the thread like iMessage does.
+  - **Delta refresh (LP3-18).** The sweep is split into `sweepRows(limit, after)`
+    (fetch) + `deriveConversations(rows)` (the pass-1/pass-2 logic above). The
+    ViewModel retains the swept rows (`sweepRows`, ~1000 newest); unattended
+    refreshes (`deltaRefresh()` — socket-triggered and post-send) fetch only
+    messages `after:` the newest row, merge, and re-derive — a few KB instead of
+    the full ~2–3 MB sweep, debounced 2 s so socket bursts coalesce. User-driven
+    refreshes (Refresh button, Settings, group ops, delete) stay full sweeps —
+    that's the recovery path for anything a delta can't see (deletions, forked-room
+    reshuffles, `serverInfo`/contacts re-checks, unread reconciliation).
+  - **Attachment downloads are server-downscaled (LP3-19):** the inline loader
+    passes `maxDim=1080` and `downloadAttachment` sends it as `width`/`height`,
+    so the server resizes images before they cross the wire (non-images and GIFs
+    ignore the params). `openAttachment`'s file handoff still fetches originals.
   - **Forked-group merge (`conversations` pass 2 + `groupIdentity`).** A group iMessage
     has split into sibling rooms (same name + identical participants, different guid)
     is collapsed into one `Conversation` whose `guids` lists every room (newest-active

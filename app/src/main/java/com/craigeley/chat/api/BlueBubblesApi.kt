@@ -73,7 +73,20 @@ class BlueBubblesApi(private val baseUrl: String, private val password: String) 
      * conversation spanning all those guids, so it shows as a single row and its
      * thread merges messages from every room (see [groupIdentity] + ChatViewModel.open).
      */
-    fun conversations(limit: Int = 1000): List<Conversation> {
+    fun conversations(limit: Int = 1000): List<Conversation> = deriveConversations(sweepRows(limit))
+
+    /** One row of the conversation sweep: a parsed message plus the raw chat
+     *  objects it belongs to. The ViewModel retains the swept rows so a delta
+     *  refresh can merge freshly-fetched ones and re-derive the list (LP3-18). */
+    class SweepRow(val chats: JSONArray, val msg: ChatMessage)
+
+    /**
+     * Fetches the sweep [conversations] derives from: the newest [limit] messages
+     * globally, each carrying its embedded chat objects. With [after] set, only
+     * messages newer than that epoch-millis date transfer — the delta path, a few
+     * KB against the full sweep's ~2-3 MB (LP3-18).
+     */
+    fun sweepRows(limit: Int = 1000, after: Long? = null): List<SweepRow> {
         val body = JSONObject()
             .put("limit", limit)
             .put("offset", 0)
@@ -82,22 +95,32 @@ class BlueBubblesApi(private val baseUrl: String, private val password: String) 
             // tell text-less messages apart from genuinely empty ones.
             .put("with", JSONArray().put("chats").put("chats.participants").put("attachment"))
             .put("sort", "DESC")
+        if (after != null) body.put("after", after)
         val respText = requestChecked("POST", "/api/v1/message/query", body, what = "message/query")
         val data = JSONObject(respText).optJSONArray("data") ?: JSONArray()
-        // Parse every swept message once, indexed by guid, so a tapback can describe
-        // its target ("an image" vs a quote) for the list. The target is an *older*
-        // message (later in this DESC sweep), so we need the full index up front.
-        val rows = ArrayList<Pair<JSONArray, ChatMessage>>(data.length())
+        val parsed = ArrayList<SweepRow>(data.length())
+        for (i in 0 until data.length()) {
+            val m = data.getJSONObject(i)
+            val chats = m.optJSONArray("chats") ?: continue
+            parsed.add(SweepRow(chats, parseMessage(m)))
+        }
+        return parsed
+    }
+
+    /** The list-derivation half of [conversations], usable on any row set — the
+     *  full sweep or a delta-merged one. Row order doesn't matter (re-sorted
+     *  newest-first here, which every pass below depends on). */
+    fun deriveConversations(sweep: List<SweepRow>): List<Conversation> {
+        val rows = sweep.sortedByDescending { it.msg.date }.map { it.chats to it.msg }
+        // Every swept message indexed by guid, so a tapback can describe its
+        // target ("an image" vs a quote) for the list. The target is an *older*
+        // message (later in this DESC ordering), so we need the full index up front.
         val msgByGuid = HashMap<String, ChatMessage>()
         // Newest non-reaction message date per room — the signal for which sibling of a
         // forked group is the *live* one (the send target). A tapback can land in a dead
         // old room, so the newest message of *any* kind isn't a reliable send target.
         val realDateByGuid = HashMap<String, Long>()
-        for (i in 0 until data.length()) {
-            val m = data.getJSONObject(i)
-            val chats = m.optJSONArray("chats") ?: continue
-            val msg = parseMessage(m)
-            rows.add(chats to msg)
+        for ((_, msg) in rows) {
             msgByGuid[msg.guid] = msg
         }
         // Pass 1: one row per chat room, newest activity first. The newest message
@@ -364,21 +387,17 @@ class BlueBubblesApi(private val baseUrl: String, private val password: String) 
             setRequestProperty("Content-Type", "multipart/form-data; boundary=$boundary")
             setChunkedStreamingMode(0) // stream the file, don't buffer it all in RAM
         }
-        return try {
-            conn.outputStream.use { out ->
-                out.write(preamble.toByteArray(Charsets.UTF_8))
-                out.write(bytes)
-                out.write(epilogue.toByteArray(Charsets.UTF_8))
-            }
-            val code = conn.responseCode
-            val stream = if (code in 200..299) conn.inputStream else conn.errorStream
-            val resp = stream?.bufferedReader()?.use { it.readText() } ?: ""
-            if (code !in 200..299) throw ApiException(code, "send attachment failed ($code)")
-            dataObject(resp)?.let { parseMessage(it) }
-                ?: ChatMessage(tempGuid, ChatMessage.ATTACHMENT_PLACEHOLDER, System.currentTimeMillis(), fromMe = true, sender = null)
-        } finally {
-            conn.disconnect()
+        conn.outputStream.use { out ->
+            out.write(preamble.toByteArray(Charsets.UTF_8))
+            out.write(bytes)
+            out.write(epilogue.toByteArray(Charsets.UTF_8))
         }
+        val code = conn.responseCode
+        val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+        val resp = stream?.bufferedReader()?.use { it.readText() } ?: ""
+        if (code !in 200..299) throw ApiException(code, "send attachment failed ($code)")
+        return dataObject(resp)?.let { parseMessage(it) }
+            ?: ChatMessage(tempGuid, ChatMessage.ATTACHMENT_PLACEHOLDER, System.currentTimeMillis(), fromMe = true, sender = null)
     }
 
     /**
@@ -386,23 +405,24 @@ class BlueBubblesApi(private val baseUrl: String, private val password: String) 
      * to [dest]. Used by the inline image loader; deliberately not routed through
      * [request] (which buffers a text body) since these are binary and large.
      */
-    fun downloadAttachment(guid: String, dest: File) {
+    fun downloadAttachment(guid: String, dest: File, maxDim: Int? = null) {
         val url = URL(buildString {
             append(baseUrl).append("/api/v1/attachment/").append(enc(guid)).append("/download")
             append("?password=").append(enc(password))
+            // Server-side downscale: the server resizes images to fit width/height
+            // before sending, so we don't ship a 4 MB original just to decode it
+            // down to screen size anyway (LP3-19). Non-images (and GIFs) ignore
+            // the params and arrive untouched.
+            if (maxDim != null) append("&width=").append(maxDim).append("&height=").append(maxDim)
         })
         val conn = (url.openConnection() as HttpURLConnection).apply {
             requestMethod = "GET"
             connectTimeout = 15_000
             readTimeout = 30_000
         }
-        try {
-            val code = conn.responseCode
-            if (code !in 200..299) throw ApiException(code, "attachment download failed ($code)")
-            conn.inputStream.use { input -> dest.outputStream().use { input.copyTo(it) } }
-        } finally {
-            conn.disconnect()
-        }
+        val code = conn.responseCode
+        if (code !in 200..299) throw ApiException(code, "attachment download failed ($code)")
+        conn.inputStream.use { input -> dest.outputStream().use { input.copyTo(it) } }
     }
 
     /**
@@ -533,17 +553,16 @@ class BlueBubblesApi(private val baseUrl: String, private val password: String) 
                 setRequestProperty("Content-Type", "application/json")
             }
         }
-        return try {
-            if (body != null) {
-                conn.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
-            }
-            val code = conn.responseCode
-            val stream = if (code in 200..299) conn.inputStream else conn.errorStream
-            val text = stream?.bufferedReader()?.use { it.readText() } ?: ""
-            code to text
-        } finally {
-            conn.disconnect()
+        // No disconnect(): closing the stream after a full read returns the socket
+        // to the keep-alive pool; disconnect() would evict it and every call over
+        // the Tailscale tunnel would pay a fresh TLS handshake (LP3-22).
+        if (body != null) {
+            conn.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
         }
+        val code = conn.responseCode
+        val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+        val text = stream?.bufferedReader()?.use { it.readText() } ?: ""
+        return code to text
     }
 
     /**

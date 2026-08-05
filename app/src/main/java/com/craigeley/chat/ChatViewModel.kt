@@ -30,6 +30,13 @@ enum class Status { Idle, Loading, Ready, Error }
 // Send a typing "stop" this long after the last keystroke; expire a received
 // "typing" after this long without a refresh (the server re-emits ~every 5s).
 private const val TYPING_PAUSE_MS = 4_000L
+
+/** The conversation sweep's window — how many newest messages the list derives from. */
+private const val SWEEP_LIMIT = 1000
+
+/** How long a delta refresh waits before firing, so a socket burst (several
+ *  messages for an unknown chat, say) coalesces into one small fetch. */
+private const val DELTA_DEBOUNCE_MS = 2_000L
 private const val TYPING_EXPIRY_MS = 12_000L
 
 data class UiState(
@@ -75,6 +82,13 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     private var loadJob: Job? = null
     private var threadJob: Job? = null
+    private var deltaJob: Job? = null
+
+    // The rolling sweep the conversation list derives from (the newest ~SWEEP_LIMIT
+    // messages, each with its embedded chat objects). Kept so a delta refresh can
+    // fetch only messages newer than what's here, merge, and re-derive — the same
+    // logic path as a full sweep, at a fraction of the transfer (LP3-18).
+    private var sweepRows: List<BlueBubblesApi.SweepRow> = emptyList()
 
     // The address book is small (hundreds of contacts) and changes rarely, so we
     // fetch it once per session alongside the first conversation load and cache it.
@@ -179,24 +193,62 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     fun refresh() {
         if (api == null) return
         loadJob?.cancel()
+        deltaJob?.cancel() // a full sweep supersedes any pending delta
         loadJob = viewModelScope.launch(Dispatchers.IO) { loadConversations() }
     }
 
-    private suspend fun loadConversations() {
+    /**
+     * The cheap list refresh: fetches only messages newer than [sweepRows] already
+     * holds, merges, and re-derives — a few KB against the full sweep's megabytes.
+     * Debounced by [DELTA_DEBOUNCE_MS] so a socket burst coalesces into one fetch.
+     * Used by the unattended triggers (socket events, post-send); user-driven
+     * refreshes stay full sweeps. Falls back to a full sweep when nothing's cached.
+     */
+    private fun deltaRefresh() {
+        if (api == null) return
+        if (deltaJob?.isActive == true) return // one pending delta covers the burst
+        deltaJob = viewModelScope.launch(Dispatchers.IO) {
+            delay(DELTA_DEBOUNCE_MS)
+            loadConversations(delta = true)
+        }
+    }
+
+    private suspend fun loadConversations(delta: Boolean = false) {
         val client = api ?: return
-        _state.update { it.copy(status = Status.Loading, message = null) }
+        val asDelta = delta && sweepRows.isNotEmpty()
+        // A delta is an invisible background touch-up — no Loading flash.
+        if (!asDelta) _state.update { it.copy(status = Status.Loading, message = null) }
         try {
-            val convos = client.conversations().sortedByDescending { it.lastDate }
+            val rows = if (asDelta) {
+                val fresh = client.sweepRows(after = sweepRows.maxOf { it.msg.date })
+                if (fresh.isEmpty()) {
+                    sweepRows
+                } else {
+                    (fresh + sweepRows)
+                        .distinctBy { it.msg.guid }
+                        .sortedByDescending { it.msg.date }
+                        .take(SWEEP_LIMIT)
+                }
+            } else {
+                client.sweepRows(SWEEP_LIMIT)
+            }
+            sweepRows = rows
+            val convos = client.deriveConversations(rows).sortedByDescending { it.lastDate }
                 // Honor unreads already cleared on this device (see clearedUnread).
                 .map { c ->
                     if (c.unread && (clearedUnread[c.guid] ?: 0L) >= c.lastDate) c.copy(unread = false) else c
                 }
             // Re-check Private API liveness so enabling/disabling it on the server
-            // (or the helper dropping) reflects without re-running setup.
-            val privateApi = runCatching { client.serverInfo() }.getOrNull()
-                ?.also { Store.setPrivateApi(app, it.privateApiReady) }
-                ?.privateApiReady ?: _state.value.privateApi
-            if (!contactsLoaded) {
+            // (or the helper dropping) reflects without re-running setup. Skipped on
+            // the delta path — it's meant to stay a single small request.
+            val privateApi = if (asDelta) {
+                _state.value.privateApi
+            } else {
+                runCatching { client.serverInfo() }.getOrNull()
+                    ?.also { Store.setPrivateApi(app, it.privateApiReady) }
+                    ?.privateApiReady ?: _state.value.privateApi
+            }
+            if (!asDelta && !contactsLoaded) {
                 runCatching { client.contacts() }.onSuccess { raw ->
                     // A server that can't read the Mac's address book (seen after a
                     // BlueBubbles restart when its contacts access came up broken)
@@ -783,8 +835,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     lastFromMe = true,
                 )
                 _state.update { it.copy(message = null) }
-                open(convo)   // land in the new thread (fetch pulls the sent image)
-                refresh()     // and pull it into the conversation list
+                open(convo)     // land in the new thread (fetch pulls the sent image)
+                deltaRefresh()  // and pull it into the conversation list
             } catch (t: Throwable) {
                 _state.update { it.copy(message = t.message ?: "Couldn’t send image") }
             }
@@ -844,8 +896,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     lastFromMe = true,
                 )
                 _state.update { it.copy(message = null) }
-                open(convo)   // land the user in the new thread
-                refresh()     // and pull it into the conversation list
+                open(convo)     // land the user in the new thread
+                deltaRefresh()  // and pull it into the conversation list
             } catch (t: Throwable) {
                 _state.update { it.copy(message = t.message ?: "Couldn’t start the message") }
             }
@@ -975,7 +1027,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     s
                 }
             }
-            refresh()
+            deltaRefresh()
         }
         // Fold the message into the open thread's raw list (a tapback lands on its
         // target; a normal message appends). foldReactions re-runs in updateOpenThread.
@@ -989,8 +1041,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 ?.let { clearUnread(it.guid) }
         }
         // A message for a chat not currently in the list (e.g. a brand-new
-        // conversation) — pull the list again so it appears with full metadata.
-        if (!known) refresh()
+        // conversation) — a delta pull picks it up with full metadata (the
+        // triggering message is by definition newer than the sweep).
+        if (!known) deltaRefresh()
     }
 
     /** A `chat-read-status-changed` from the socket: the chat was read somewhere

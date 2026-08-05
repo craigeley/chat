@@ -40,7 +40,9 @@ object Attachments {
         return withContext(Dispatchers.IO) {
             val file = File(context.cacheDir, "att_" + safeName(attachment.guid))
             if (!file.exists() || file.length() == 0L) {
-                runCatching { api.downloadAttachment(attachment.guid, file) }.getOrElse {
+                // maxDim asks the server to downscale before sending — we'd decode
+                // down to MAX_DIM anyway, so the extra bytes were pure waste (LP3-19).
+                runCatching { api.downloadAttachment(attachment.guid, file, maxDim = MAX_DIM) }.getOrElse {
                     file.delete() // don't leave a truncated file to be trusted next time
                     return@withContext null
                 }

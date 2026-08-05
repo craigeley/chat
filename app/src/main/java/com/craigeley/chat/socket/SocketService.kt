@@ -53,6 +53,13 @@ class SocketService : Service() {
             transports = arrayOf("websocket") // server upgrades to ws anyway; skip polling
             query = "password=" + URLEncoder.encode(password, "UTF-8")
             reconnection = true
+            // Defaults retry forever with backoff capped at 5s — and websocket-only
+            // means every attempt on a half-dead link (TLS up, session dies) pays a
+            // full cert-chain handshake, indefinitely, often on cellular. Let a down
+            // link settle to ~1 attempt/min instead; the delay resets to fast on a
+            // successful reconnect (LP3-23).
+            reconnectionDelay = 2_000
+            reconnectionDelayMax = 60_000
         }
         val s = runCatching { IO.socket(baseUrl, opts) }.getOrNull() ?: run { stopSelf(); return }
         socket = s
