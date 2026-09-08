@@ -199,6 +199,27 @@ class BlueBubblesApi(private val baseUrl: String, private val password: String) 
         return "g|${c.displayName}|${c.participants.sorted().joinToString(",")}"
     }
 
+    /**
+     * The socket's catch-up query: every message created after [after] (epoch
+     * millis), oldest first, decoded exactly like a socket event ([messageEvent] —
+     * embedded chats for routing, `handle` for the sender name in a notification)
+     * so `SocketService` can replay a gap through its normal delivery path. Newest
+     * [limit] only; a longer gap than that is the ViewModel's delta refresh's job.
+     */
+    fun messagesSince(after: Long, limit: Int = 100): List<IncomingMessage> {
+        val body = JSONObject()
+            .put("limit", limit)
+            .put("offset", 0)
+            .put("with", JSONArray().put("chats").put("handle").put("attachment"))
+            .put("sort", "DESC")
+            .put("after", after)
+        val respText = requestChecked("POST", "/api/v1/message/query", body, what = "message/query")
+        val data = JSONObject(respText).optJSONArray("data") ?: JSONArray()
+        return (0 until data.length())
+            .mapNotNull { messageEvent(data.getJSONObject(it), isNew = true) }
+            .sortedBy { it.message.date }
+    }
+
     /** `GET /api/v1/chat/:guid/message` — messages in one conversation, newest first. */
     fun messages(chatGuid: String, limit: Int = 100, offset: Int = 0): List<ChatMessage> {
         val path = "/api/v1/chat/${enc(chatGuid)}/message"

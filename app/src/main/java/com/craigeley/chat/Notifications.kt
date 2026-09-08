@@ -14,7 +14,11 @@ import android.content.Intent
  * that keeps the live-socket service alive.
  */
 object Notifications {
-    private const val MESSAGE_CHANNEL = "messages"
+    // v2: vibrates. A channel's vibration can't be changed after creation, so the
+    // original silent-buzz "messages" channel is replaced (and deleted) — on a Light
+    // Phone with no notification shade the buzz *is* the alert.
+    private const val MESSAGE_CHANNEL = "messages_v2"
+    private const val LEGACY_MESSAGE_CHANNEL = "messages"
     private const val SERVICE_CHANNEL = "service"
     const val SERVICE_ID = 2
     /** Intent extra on a message notification's tap: the chat to open. */
@@ -32,8 +36,12 @@ object Notifications {
             manager.createNotificationChannel(
                 NotificationChannel(MESSAGE_CHANNEL, "Messages", NotificationManager.IMPORTANCE_HIGH).apply {
                     description = "New iMessages"
+                    enableVibration(true)
                 },
             )
+        }
+        if (manager.getNotificationChannel(LEGACY_MESSAGE_CHANNEL) != null) {
+            manager.deleteNotificationChannel(LEGACY_MESSAGE_CHANNEL)
         }
         if (manager.getNotificationChannel(SERVICE_CHANNEL) == null) {
             manager.createNotificationChannel(
@@ -44,15 +52,24 @@ object Notifications {
         }
     }
 
-    /** The quiet ongoing notification the foreground service runs under. */
-    fun foregroundNotification(context: Context): Notification =
+    /** The quiet ongoing notification the foreground service runs under; [status]
+     *  is its one line of text ("Connected" / "Reconnecting…" / …). */
+    fun foregroundNotification(context: Context, status: String): Notification =
         Notification.Builder(context, SERVICE_CHANNEL)
             .setSmallIcon(R.drawable.ic_stat_reply)
             .setContentTitle("chat")
-            .setContentText("Connected")
+            .setContentText(status)
             .setOngoing(true)
+            .setOnlyAlertOnce(true)
             .setContentIntent(openApp(context))
             .build()
+
+    /** Re-posts the ongoing notification with a new [status] line — the socket's
+     *  connection state, visible from Android's notification settings. */
+    fun updateForeground(context: Context, status: String) {
+        val manager = context.getSystemService(NotificationManager::class.java) ?: return
+        manager.notify(SERVICE_ID, foregroundNotification(context, status))
+    }
 
     /** A per-message notification, posted when a message arrives while backgrounded.
      *  One notification per chat (a newer message replaces it); tapping opens that

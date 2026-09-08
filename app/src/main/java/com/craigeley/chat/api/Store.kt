@@ -18,6 +18,7 @@ object Store {
     private const val KEY_CONTACTS = "contacts"    // normalized key → name, JSON
     private const val KEY_BASE_URL = "base_url"    // the server URL, set at setup
     private const val KEY_PRIVATE_API = "private_api" // server's Private API live?
+    private const val KEY_LAST_SEEN = "last_seen_date" // newest message date seen (catch-up cursor)
 
     /** The configured BlueBubbles Server URL, or null if setup hasn't run yet. */
     fun baseUrl(context: Context): String? =
@@ -71,6 +72,21 @@ object Store {
 
     fun setPrivateApi(context: Context, value: Boolean) {
         prefs(context).edit().putBoolean(KEY_PRIVATE_API, value).apply()
+    }
+
+    /**
+     * The catch-up cursor: the `dateCreated` of the newest message this device has
+     * seen, by any path (a socket event, a replay, or the ViewModel's sweep). On
+     * every socket connect `SocketService` replays what the server has after this
+     * point, so nothing that arrived during a gap is missed. 0 until the first
+     * sweep seeds it. Only ever advances ([advanceLastSeen]).
+     */
+    fun lastSeenDate(context: Context): Long = prefs(context).getLong(KEY_LAST_SEEN, 0L)
+
+    fun advanceLastSeen(context: Context, date: Long) {
+        if (date <= 0L) return
+        val prefs = prefs(context)
+        if (date > prefs.getLong(KEY_LAST_SEEN, 0L)) prefs.edit().putLong(KEY_LAST_SEEN, date).apply()
     }
 
     /** Sign out: wipe the stored password. */

@@ -174,8 +174,19 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk      # install on devic
 Only `arm64-v8a` is built (the Light Phone's ABI). minSdk 34 (matches the device —
 Android 14), target/compile SDK 35. JDK 21 runs Gradle; the app compiles to Java
 11 bytecode. Android SDK at `/opt/homebrew/share/android-commandlinetools`. The
-device shows in `adb devices` as `LightPhoneIII` / model `TLP301` (USB or
-adb-over-wifi; it is otherwise reached only over Tailscale).
+device shows in `adb devices` as serial `LP3LHMA580700480` (was `LightPhoneIII`
+before the 2026-08 factory reset) / model `TLP301` (USB or adb-over-wifi; it is
+otherwise reached only over Tailscale).
+
+Useful while working on the socket (all from the Mac):
+
+```sh
+adb logcat -d | grep -E "SocketService|BootReceiver"      # connect/idle/catch-up trail
+adb shell dumpsys activity services com.craigeley.chat      # allowStartForeground=…
+adb shell cmd connectivity airplane-mode enable|disable     # total-loss test
+adb shell svc wifi disable|enable                           # handover test (VPN hides it)
+adb shell "dumpsys connectivity | grep -oE 'network\{[0-9]+\}.*Transports: [A-Z|]+'"
+```
 
 ## Setup / auth
 
@@ -197,7 +208,8 @@ clears the password and returns to setup.
   app running; the ViewModel writes it on each contacts load, `signOut` wipes it
   with everything else. Also caches the **Private API flag** (`privateApi`/
   `setPrivateApi`) read from `server/info`, so the UI knows on launch whether to
-  offer tapbacks before the first refresh lands.
+  offer tapbacks before the first refresh lands. And the **catch-up cursor**
+  (`lastSeenDate`/`advanceLastSeen`, monotonic) — see the Socket section.
 - **`SecureStore`** (`api/SecureStore.kt`) — at-rest encryption only. An
   AES-256-GCM key lives non-exportable in the AndroidKeyStore (hardware-backed)
   and encrypts the password. (Trimmed down from `ask`'s version — no Ed25519 /
@@ -214,7 +226,8 @@ clears the password and returns to setup.
   only; clears unread across the account's devices); `startTyping(guid)`/
   `stopTyping(guid)` → `POST`/`DELETE /chat/:guid/typing` (Private-API only);
   `messages(guid)` → `GET /chat/:guid/message`
-  (`with=handle,attachment`, `sort=DESC`, guid URL-encoded); `send(guid,text,tempGuid,
+  (`with=handle,attachment`, `sort=DESC`, guid URL-encoded); `messagesSince(after)`
+  → `POST /message/query` decoded as `IncomingMessage`s (the socket's catch-up); `send(guid,text,tempGuid,
   method)` → `POST /message/text` (only `chatGuid`+`message` required; we pass a
   `tempGuid` to correlate the echo and a `method` — `private-api` when the server's
   Private API is live, else `apple-script`. The ViewModel picks the method via
@@ -315,6 +328,18 @@ clears the password and returns to setup.
   `markReadIfPrivate(guid)` fires `markRead` best-effort (off-main, errors ignored)
   when you open a thread and on a foreground incoming message, so reading here
   clears the unread on your other devices — also gated on `state.privateApi`.
+  **Connection edges (`applyConnection`):** a socket drop that outlasts 5s flips
+  `state.connected` (the list shows a dim "Offline — reconnecting…" line; Settings
+  shows the state under the server); the next connect pulls a `deltaRefresh()`
+  and re-fetches the open thread (`loadThread`). A first connect after a failed
+  launch sweep finds no rows, so that "delta" is the full sweep — the Error state
+  recovers by itself. `onAppVisible()` (from `MainActivity.onStart`) delta-pulls
+  if the list is >30s stale — the safety net for anything the live channel
+  missed. `deltaRefresh()` is a no-op while a full sweep is in flight (otherwise
+  an empty `sweepRows` would make it a *second* full sweep). `applyIncoming`
+  ignores a message **older than the row's `lastDate`** for preview/recency (it
+  still merges into the thread) — a catch-up replay landing after a delta, or a
+  receipt update on an earlier message, used to drag the row backwards.
   **Typing:** collects `SocketBus.typing` into `state.typingChatGuid` (with a 12s
   auto-expiry, since a "stopped" event can be missed); `onComposeTextChanged` sends
   `startTyping` on the first keystroke and `stopTyping` after a 4s pause / empty
@@ -327,29 +352,73 @@ clears the password and returns to setup.
   from `contacts()`) feeds the new-message picker. Screen routing derives from
   state: no password → setup; `composingNew` → new message; `open != null` →
   thread; else list.
-- **Socket** (`socket/`) — the live channel.
+- **Socket** (`socket/`) — the live channel. **This is the part that has to be
+  rock solid: battery on one side, realtime delivery on the other.** The design
+  (0.7.0) and what's been verified on the device:
   - **`SocketService`** — a **`remoteMessaging`** foreground service holding one
     Socket.IO connection (`io.socket:socket.io-client`, websocket transport,
-    password as a query param). On `new-message`/`updated-message` it parses via
-    `BlueBubblesApi.messageEvent`, pushes onto `SocketBus`, and — when the app
-    isn't foreground — posts a notification. The single ongoing socket is the
-    whole battery argument vs OpenBubbles' Flutter runtime. (Type is
-    `remoteMessaging`, not `dataSync`, specifically because Android 14+ **blocks
-    `dataSync` from starting at `BOOT_COMPLETED`** — `remoteMessaging` is allowed
-    and is the correct semantic type.)
-  - **`BootReceiver`** — restarts `SocketService` on `BOOT_COMPLETED` (if a
-    password is stored) so the socket reconnects after a reboot without opening
-    the app. BOOT_COMPLETED arrives post-unlock, so encrypted prefs / Keystore
-    are available. Needs `RECEIVE_BOOT_COMPLETED`. **Device requirement:** the
-    socket can't reach `…ts.net` until Tailscale's tunnel is up, which isn't the
-    case at boot unless **Tailscale "Always-on VPN"** is enabled (Android Settings
-    → Network → VPN). With it on, the service's reconnect loop connects the moment
-    the tunnel comes up (verified: ~15s of `connect error` retries post-boot, then
-    `socket connected` the instant Tailscale connected). Leave "Block connections
-    without VPN" OFF.
-  - **`SocketBus`** — process-wide `MutableSharedFlow`s bridging the service (alive
-    even when the activity is dead) to the ViewModel: `incoming` (messages) and
-    `typing` (`TypingEvent`, from the socket's `typing-indicator` event).
+    password as a query param, `forceNew` so each service instance gets a fresh
+    Manager). On `new-message`/`updated-message` it parses via
+    `BlueBubblesApi.messageEvent` and hands off to `deliver()` — the **one path
+    every message takes, live or replayed**: advance the catch-up cursor, push
+    onto `SocketBus`, and — when the app isn't foreground — post a notification.
+    The single ongoing socket is the whole battery argument vs OpenBubbles'
+    Flutter runtime. (Type is `remoteMessaging`, not `dataSync`, specifically
+    because Android 14+ **blocks `dataSync` from starting at `BOOT_COMPLETED`** —
+    `remoteMessaging` is allowed and is the correct semantic type.)
+    - **Network-driven reconnects.** Two `ConnectivityManager` callbacks (needs
+      `ACCESS_NETWORK_STATE`) drive the socket instead of blind retries. The
+      *default-network* callback sees the network the app actually uses — under
+      Tailscale that's the **VPN network** — so it connects the instant the
+      tunnel comes up after boot (previously up to a 60s backoff wait). But a VPN
+      network **outlives its underlying link** (verified: Wi-Fi off and even
+      airplane mode leave Tailscale's network in place, and a live socket simply
+      rides the WireGuard migration when the link returns — no reconnect, no
+      churn), so a second callback (`NET_CAPABILITY_INTERNET` + `NOT_VPN`) watches
+      the **physical** networks: when the last one goes, `goIdle()` disconnects
+      and stops retrying (a dead spot costs no DNS/TLS attempts); when one appears
+      while the socket is down, it reconnects at once (verified: airplane off →
+      `socket connected` in ~600ms). Both callbacks fire on registration, which is
+      what performs the initial connect; requests coalesce through
+      `requestReconnect()` (300ms) so the pair yields one attempt.
+      **Gotcha:** a forced reconnect must be `disconnect()` **then** `connect()` —
+      the client's `connect()` is a no-op while its backoff timer is pending
+      (`Manager.isReconnecting`), and `disconnect()` is what cancels that timer.
+      The library backoff (2s → 60s, LP3-23) still covers "network up, server
+      down". The server pings every **60s** with a **120s** timeout (read off its
+      Engine.IO handshake), so a silently-dead session is noticed within ~3min;
+      on a VPN that's the only way it *can* be noticed.
+    - **Catch-up on connect.** The server only pushes what happens while the
+      socket is open, so every `EVENT_CONNECT` replays `messagesSince(cursor)`
+      (`POST /message/query`, `after:`, `with: chats,handle,attachment`, newest
+      100) through `deliver()`, oldest first. The cursor is `Store.lastSeenDate`
+      — the newest `dateCreated` seen by any path (socket event, replay, or the
+      ViewModel's sweep, which seeds it), persisted so a boot-time start knows
+      where the last session left off. Replayed messages already **read
+      elsewhere** (`dateRead != 0`) merge silently — a phone that was off
+      overnight doesn't buzz for conversations you already had on the Mac.
+      Verified: `catch-up: N message(s) since …` logs on every connect.
+    - **Connection state** goes out on `SocketBus.connected` and onto the ongoing
+      notification's text (`Connected` / `Reconnecting…` / `Offline — waiting for
+      a network`, re-posted only on change so a flapping link can't spam).
+  - **`BootReceiver`** — restarts `SocketService` on **`BOOT_COMPLETED`** *and*
+    **`MY_PACKAGE_REPLACED`** (if a password is stored). The latter matters for
+    sideloaded/Obtainium updates: an install kills the process and nothing else
+    brings the service back until the next launch. Both broadcasts carry a
+    temp-allowlist that permits the background FGS start on Android 14 (verified
+    in `dumpsys activity services`: `allowStartForeground=PACKAGE_REPLACED`); the
+    start is wrapped so a policy refusal degrades to "starts on next launch".
+    BOOT_COMPLETED arrives post-unlock, so encrypted prefs / Keystore are
+    available. Needs `RECEIVE_BOOT_COMPLETED`. **Device requirement:** the socket
+    can't reach `…ts.net` until Tailscale's tunnel is up, which after a reboot
+    only happens on its own if **Tailscale "Always-on VPN"** is enabled (Android
+    Settings → Network → VPN; leave "Block connections without VPN" OFF). Without
+    it (the state observed 2026-09-08: `always_on_vpn_app` unset, ~70s of
+    `connect error` after boot until Tailscale was opened by hand) the service
+    waits idle until the tunnel appears, then connects immediately.
+  - **`SocketBus`** — process-wide flows bridging the service (alive even when the
+    activity is dead) to the ViewModel: `incoming` (messages), `typing`
+    (`TypingEvent`), `readStatus`, and the `connected` `StateFlow`.
   - **`AppForeground`** — a volatile flag set by `MainActivity.onStart/onStop` so
     the service only notifies for messages the user isn't already looking at.
 - **Models** (`Models.kt`) — `Conversation` (carries `guids: List<String>` — every
@@ -432,8 +501,14 @@ clears the password and returns to setup.
   marks, your current one bright so re-tapping reads as remove) — only when
   `state.privateApi` is true (`combinedClickable(enabled = canReact)`), since sending
   needs the server's Private API. `Notifications` has two
-  channels — high-importance "messages" (per-message) and low "service" (the
-  ongoing foreground notification).
+  channels — high-importance **`messages_v2`** (per-message, **vibrates**; a
+  channel's vibration can't be changed after creation, so the original silent
+  `messages` channel is deleted on startup) and low "service" (the ongoing
+  foreground notification, whose text is the socket state). On stock LightOS
+  there's no notification shade, so the buzz *is* the alert — **confirmed
+  2026-09-08:** under `light_mode` a background message vibrates and plays the
+  notification sound (when the volume is up). NotificationManagerService does
+  the buzz/beep, not SystemUI, so LightOS hiding the shade doesn't suppress it.
 
 ## Light Phone III specifics
 

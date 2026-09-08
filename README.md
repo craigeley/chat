@@ -86,10 +86,32 @@ adb shell pm grant com.craigeley.chat android.permission.WRITE_SECURE_SETTINGS
 One-time; it survives app updates. Without it, photos simply open in grayscale
 like the rest of the phone.
 
-For instant delivery after a reboot without opening the app, enable Tailscale's
+## Staying connected
+
+Chat keeps one websocket open to your server from a small foreground service —
+that's how messages arrive instantly without Google push. It is built to hold up
+unattended:
+
+- It reconnects the moment a network appears (after a reboot, when Tailscale's
+  tunnel comes up, when you leave a dead spot) and goes idle — no retries at all —
+  while there is no network, so a bad signal doesn't cost battery.
+- Every time it connects it asks the server for anything that arrived while it
+  was away, so a message sent while the phone was off or out of range still
+  shows up and still buzzes (unless you already read it on another device).
+- It restarts itself after a reboot and after you update the app.
+- A message that arrives while chat is in the background buzzes (and dings, if
+  the volume is up) — on stock LightOS too, where there is no notification shade.
+- The ongoing "chat" notification's text shows the state (`Connected`,
+  `Reconnecting…`, `Offline — waiting for a network`), and the conversation list
+  says "Offline — reconnecting…" if the link has been down for more than a few
+  seconds.
+
+For delivery after a reboot without opening the app, enable Tailscale's
 **Always-on VPN** on the phone (Android Settings → Network → VPN) and leave
-"Block connections without VPN" **off** — the live socket reconnects the moment
-the tunnel comes up.
+"Block connections without VPN" **off** — otherwise the service waits, idle,
+until you open Tailscale yourself. Over a day and a half of the 0.6.0 service on
+the Light Phone III, chat used about a minute and a half of CPU and 4 MB of
+Wi-Fi data.
 
 ## Install
 

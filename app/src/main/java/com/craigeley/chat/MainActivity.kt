@@ -77,6 +77,9 @@ class MainActivity : ComponentActivity() {
         super.onStart()
         AppForeground.active = true
         Notifications.clear(this)
+        // Coming back to the app: a cheap delta pull covers anything the live
+        // channel couldn't (the safety net for a phone that sat in a dead spot).
+        viewModel.onAppVisible()
         // Re-lift grayscale if the user left with the image viewer open.
         ColorMode.onAppVisible(this)
     }

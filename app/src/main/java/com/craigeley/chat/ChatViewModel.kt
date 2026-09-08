@@ -39,6 +39,14 @@ private const val SWEEP_LIMIT = 1000
 private const val DELTA_DEBOUNCE_MS = 2_000L
 private const val TYPING_EXPIRY_MS = 12_000L
 
+/** Returning to the app re-pulls the list (delta) if the last load is older than
+ *  this — cheap insurance for anything the live channel missed. */
+private const val FOREGROUND_REFRESH_MS = 30_000L
+
+/** How long the socket must stay down before the list shows an offline hint —
+ *  long enough that a normal launch or a quick handover never flashes it. */
+private const val OFFLINE_HINT_DELAY_MS = 5_000L
+
 data class UiState(
     val isConfigured: Boolean,                 // a server URL and password are stored
     val status: Status = Status.Idle,
@@ -51,6 +59,7 @@ data class UiState(
     val composingNew: Boolean = false,         // the "New message" compose screen is open
     val privateApi: Boolean = false,           // server's Private API live → tapbacks available
     val typingChatGuid: String? = null,        // chat whose other party is currently typing
+    val connected: Boolean = true,             // live socket up (false only after a sustained drop)
     val message: String? = null,               // transient status / error line
 )
 
@@ -83,6 +92,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private var loadJob: Job? = null
     private var threadJob: Job? = null
     private var deltaJob: Job? = null
+    private var offlineHintJob: Job? = null
+    private var lastLoadAt = 0L // wall-clock of the last successful list load
 
     // The rolling sweep the conversation list derives from (the newest ~SWEEP_LIMIT
     // messages, each with its embedded chat objects). Kept so a delta refresh can
@@ -190,6 +201,14 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     // ---- Conversation list ------------------------------------------------
 
+    /** The activity came to the foreground. If the list is more than
+     *  [FOREGROUND_REFRESH_MS] stale, a delta pull reconciles anything the socket
+     *  missed while the app was away. */
+    fun onAppVisible() {
+        if (api == null) return
+        if (System.currentTimeMillis() - lastLoadAt > FOREGROUND_REFRESH_MS) deltaRefresh()
+    }
+
     fun refresh() {
         if (api == null) return
         loadJob?.cancel()
@@ -206,6 +225,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
      */
     private fun deltaRefresh() {
         if (api == null) return
+        if (loadJob?.isActive == true) return  // a full sweep in flight covers it
         if (deltaJob?.isActive == true) return // one pending delta covers the burst
         deltaJob = viewModelScope.launch(Dispatchers.IO) {
             delay(DELTA_DEBOUNCE_MS)
@@ -233,6 +253,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 client.sweepRows(SWEEP_LIMIT)
             }
             sweepRows = rows
+            lastLoadAt = System.currentTimeMillis()
+            // Everything in the sweep has been seen here — the socket's catch-up
+            // replay only needs to start after it.
+            rows.maxOfOrNull { it.msg.date }?.let { Store.advanceLastSeen(app, it) }
             val convos = client.deriveConversations(rows).sortedByDescending { it.lastDate }
                 // Honor unreads already cleared on this device (see clearedUnread).
                 .map { c ->
@@ -322,6 +346,12 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         conversation.guids.forEach { markReadIfPrivate(it) }
         clearUnread(conversation.guid)
         Notifications.clearChat(app, conversation.guids)
+        loadThread(conversation)
+    }
+
+    /** Fetches [conversation]'s messages (all rooms) and, if it's still the open
+     *  thread when they land, replaces the raw list. Cancels any fetch in flight. */
+    private fun loadThread(conversation: Conversation) {
         threadJob?.cancel()
         threadJob = viewModelScope.launch(Dispatchers.IO) {
             val client = api ?: return@launch
@@ -916,6 +946,36 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             SocketBus.readStatus.collect { applyReadStatus(it) }
         }
+        viewModelScope.launch {
+            var wasDown = false
+            SocketBus.connected.collect { up -> applyConnection(up, wasDown); wasDown = !up }
+        }
+    }
+
+    /**
+     * The live socket went up or down. A drop that outlasts [OFFLINE_HINT_DELAY_MS]
+     * shows the list's offline hint; a connect after a drop pulls a delta (the
+     * service replays missed messages itself, but the list's metadata and anything
+     * beyond its replay window come from here) and re-fetches the open thread. The
+     * first connect of a session counts too: if the launch sweep failed (server
+     * unreachable) the "delta" finds no rows and becomes the full sweep — the list
+     * recovers on its own the moment the socket gets through. A sweep already in
+     * flight (the normal cold start) makes it a no-op.
+     */
+    private fun applyConnection(up: Boolean, wasDown: Boolean) {
+        offlineHintJob?.cancel()
+        if (up) {
+            _state.update { it.copy(connected = true) }
+            if (wasDown && api != null) {
+                deltaRefresh()
+                _state.value.open?.let(::loadThread)
+            }
+        } else {
+            offlineHintJob = viewModelScope.launch {
+                delay(OFFLINE_HINT_DELAY_MS)
+                _state.update { it.copy(connected = false) }
+            }
+        }
     }
 
     // ---- Typing indicators ------------------------------------------------
@@ -994,6 +1054,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         incoming.message.isGroupEvent -> c.copy(
                             lastDate = maxOf(c.lastDate, incoming.message.date),
                         )
+                        // Older than what the row already shows — a catch-up replay
+                        // landing after a delta refresh, or a receipt update on an
+                        // earlier message. Still merged into the thread below, but
+                        // the preview/recency must not move backwards.
+                        incoming.message.date < c.lastDate -> c.copy(unread = c.unread || flagUnread)
                         // A tapback bumps recency and surfaces as "Liz loved an image"
                         // ([lastReaction]); a removal clears that overlay; a normal message
                         // updates the text preview and clears any reaction overlay.

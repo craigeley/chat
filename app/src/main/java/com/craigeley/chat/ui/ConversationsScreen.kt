@@ -100,6 +100,17 @@ fun ConversationsScreen(viewModel: ChatViewModel, onOpenSettings: () -> Unit, on
             )
         }
 
+        // Only after a sustained drop (see ChatViewModel.applyConnection) — a quick
+        // handover or a normal launch never shows it.
+        if (!state.connected) {
+            Text(
+                text = "Offline — reconnecting…",
+                style = ChatType.hint,
+                color = ChatColors.onSurfaceDisabled,
+                modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
+            )
+        }
+
         when {
             state.conversations.isEmpty() -> {
                 val label = when {

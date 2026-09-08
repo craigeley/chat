@@ -3,6 +3,10 @@
     xmlns:tools="http://schemas.android.com/tools">
 
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- SocketService watches the default network to reconnect the moment one
+         appears (and to stop retrying when none does). -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.VIBRATE" />
     <!-- Lifts LightOS's forced grayscale while the full-screen image viewer is
          open (see ColorMode). Signature-level, so it only works after a one-time
          adb grant; ungranted, the app just stays B&W. -->
@@ -44,12 +48,14 @@
             android:exported="false"
             android:foregroundServiceType="remoteMessaging" />
 
-        <!-- Reconnects the socket service after a reboot, no app launch needed. -->
+        <!-- Restarts the socket service after a reboot or an app update, no app
+             launch needed. -->
         <receiver
             android:name=".socket.BootReceiver"
             android:exported="false">
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
             </intent-filter>
         </receiver>
 

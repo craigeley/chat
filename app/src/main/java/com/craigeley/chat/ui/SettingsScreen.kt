@@ -12,6 +12,7 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -33,6 +34,7 @@ import com.craigeley.chat.ui.theme.ChatType
 @Composable
 fun SettingsScreen(viewModel: ChatViewModel, onBack: () -> Unit) {
     val context = LocalContext.current
+    val state by viewModel.state.collectAsState()
     val currentUrl = Store.baseUrl(context).orEmpty()
     var editing by remember { mutableStateOf(false) }
     var draftUrl by remember { mutableStateOf(currentUrl) }
@@ -81,7 +83,14 @@ fun SettingsScreen(viewModel: ChatViewModel, onBack: () -> Unit) {
             )
         }
 
-        Spacer(modifier = Modifier.height(36.dp))
+        Spacer(modifier = Modifier.height(12.dp))
+        Text(
+            text = if (state.connected) "Connected" else "Offline — reconnecting…",
+            style = ChatType.hint,
+            color = ChatColors.onSurfaceDisabled,
+        )
+
+        Spacer(modifier = Modifier.height(24.dp))
 
         HapticText(
             text = "Refresh conversations",
