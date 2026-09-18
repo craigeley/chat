@@ -35,6 +35,7 @@ fun HapticText(
     underline: Boolean = false,
     textAlign: TextAlign = TextAlign.Center,
     maxLines: Int = Int.MAX_VALUE,
+    softWrap: Boolean = true,
     onLongClick: (() -> Unit)? = null,
     onClick: () -> Unit,
 ) {
@@ -46,6 +47,7 @@ fun HapticText(
         color = color,
         textAlign = textAlign,
         maxLines = maxLines,
+        softWrap = softWrap,
         overflow = TextOverflow.Ellipsis,
         textDecoration = if (underline) TextDecoration.Underline else TextDecoration.None,
         modifier = modifier.combinedClickable(

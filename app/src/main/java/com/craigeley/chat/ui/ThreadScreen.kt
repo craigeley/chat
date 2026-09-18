@@ -2,6 +2,8 @@
 
 package com.craigeley.chat.ui
 
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.text.format.DateUtils
 import androidx.activity.compose.BackHandler
@@ -15,6 +17,8 @@ import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.PaddingValues
@@ -373,6 +377,7 @@ private fun MessageRow(
         convo.participants.size == 1 -> contacts.sender(convo.participants[0])
         else -> null
     }
+    val context = LocalContext.current
     // The name label sits above the turn (not inside the content column) so the
     // gutter reaction lines up with the message's first line, not the label.
     Column(
@@ -397,12 +402,28 @@ private fun MessageRow(
             )
             Spacer(modifier = Modifier.height(2.dp))
         }
+        // The long-press menu — six tapbacks, Reply, Copy — sits above the turn at
+        // the full thread width (not inside the 80% content column: on the LP3 that
+        // column is ~237dp, too narrow for eight items, and the last label used to
+        // wrap mid-word as "Repl / y").
+        if (pickerOpen) {
+            ReactionPicker(
+                selected = message.reactions.firstOrNull { it.fromMe }?.type,
+                fromMe = message.fromMe,
+                onReact = onReact,
+                onReply = onReply,
+                onCopy = message.bodyText?.let { body ->
+                    { copyToClipboard(context, body); onDismissPicker() }
+                },
+            )
+            Spacer(modifier = Modifier.height(6.dp))
+        }
         // Content is width-capped; the leftover gutter on the opposite side carries
         // any tapbacks (`<- ♥` / `♥ ->`), pointing back at the turn. 0.8/0.2 weights
         // keep the same cap whether or not there's a reaction.
         Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.Top) {
             if (message.fromMe) ReactionGutter(message, Modifier.weight(1f - MESSAGE_MAX_WIDTH))
-            MessageContent(message, loadImage, onImageTap, onOpenAttachment, canReact, pickerOpen, onLongPress, onReact, onReply, onDismissPicker, Modifier.weight(MESSAGE_MAX_WIDTH))
+            MessageContent(message, loadImage, onImageTap, onOpenAttachment, canReact, pickerOpen, onLongPress, onDismissPicker, Modifier.weight(MESSAGE_MAX_WIDTH))
             if (!message.fromMe) ReactionGutter(message, Modifier.weight(1f - MESSAGE_MAX_WIDTH))
         }
         // "Not delivered" on any sent message the Mac later failed to deliver
@@ -475,8 +496,9 @@ private fun ReactionGutter(message: ChatMessage, modifier: Modifier) {
     }
 }
 
-/** The message itself: the long-press tapback picker, inline images, tappable file
- *  rows, then the text — no bubbles, just a column hugging its side. */
+/** The message itself: inline images, tappable file rows, then the text — no
+ *  bubbles, just a column hugging its side. Long-press opens the tapback picker
+ *  (drawn by [MessageRow] above the turn); a tap while it's open dismisses it. */
 @Composable
 private fun MessageContent(
     message: ChatMessage,
@@ -486,8 +508,6 @@ private fun MessageContent(
     canReact: Boolean,
     pickerOpen: Boolean,
     onLongPress: () -> Unit,
-    onReact: (ReactionType) -> Unit,
-    onReply: () -> Unit,
     onDismissPicker: () -> Unit,
     modifier: Modifier,
 ) {
@@ -505,15 +525,6 @@ private fun MessageContent(
         ),
         horizontalAlignment = align,
     ) {
-        // The long-press menu — the six tapbacks plus Reply — sits above the turn.
-        if (pickerOpen) {
-            ReactionPicker(
-                selected = message.reactions.firstOrNull { it.fromMe }?.type,
-                onReact = onReact,
-                onReply = onReply,
-            )
-            Spacer(modifier = Modifier.height(6.dp))
-        }
         message.images.forEach { image ->
             AttachmentImage(
                 attachment = image,
@@ -566,14 +577,26 @@ private fun linkify(text: String): AnnotatedString {
     }
 }
 
-/** The six tapbacks as a row of the drawn glyphs; the user's current one (if any)
- *  shows bright so re-tapping it reads as "remove". */
+/** The long-press menu: the six tapbacks as drawn glyphs, then Reply and Copy.
+ *  The user's current tapback (if any) shows bright so re-tapping it reads as
+ *  "remove". Glyphs and the two labels are one line at the LP3's thread width;
+ *  the labels never break mid-word — if the row ever can't fit, they wrap to a
+ *  second line as a unit. [onCopy] is null for a message with no text body. */
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun ReactionPicker(selected: ReactionType?, onReact: (ReactionType) -> Unit, onReply: () -> Unit) {
+private fun ReactionPicker(
+    selected: ReactionType?,
+    fromMe: Boolean,
+    onReact: (ReactionType) -> Unit,
+    onReply: () -> Unit,
+    onCopy: (() -> Unit)?,
+) {
     val haptics = LocalHapticFeedback.current
-    Row(
-        horizontalArrangement = Arrangement.spacedBy(18.dp),
-        verticalAlignment = Alignment.CenterVertically,
+    val gap = Arrangement.spacedBy(PICKER_GAP, if (fromMe) Alignment.End else Alignment.Start)
+    FlowRow(
+        horizontalArrangement = gap,
+        verticalArrangement = Arrangement.spacedBy(4.dp),
+        itemVerticalAlignment = Alignment.CenterVertically,
     ) {
         ReactionType.entries.forEach { type ->
             Box(
@@ -588,18 +611,42 @@ private fun ReactionPicker(selected: ReactionType?, onReact: (ReactionType) -> U
                 TapbackGlyph(
                     type = type,
                     color = if (type == selected) ChatColors.onSurface else ChatColors.onSurfaceDim,
-                    size = 22.dp,
+                    size = PICKER_GLYPH,
                 )
             }
         }
-        // Inline reply rides the same menu (both are Private-API sends).
-        HapticText(
-            text = "Reply",
-            style = ChatType.hint,
-            color = ChatColors.onSurfaceVariant,
-            onClick = onReply,
-        )
+        // Reply (a Private-API send) and Copy ride the same menu, as one unit.
+        Row(horizontalArrangement = gap, verticalAlignment = Alignment.CenterVertically) {
+            HapticText(
+                text = "Reply",
+                style = ChatType.hint,
+                color = ChatColors.onSurfaceVariant,
+                maxLines = 1,
+                softWrap = false,
+                onClick = onReply,
+            )
+            if (onCopy != null) {
+                HapticText(
+                    text = "Copy",
+                    style = ChatType.hint,
+                    color = ChatColors.onSurfaceVariant,
+                    maxLines = 1,
+                    softWrap = false,
+                    onClick = onCopy,
+                )
+            }
+        }
     }
+}
+
+private val PICKER_GLYPH = 18.dp
+private val PICKER_GAP = 12.dp
+
+/** Puts [text] on the system clipboard as plain text (Android 13+ shows its own
+ *  "Copied" confirmation). */
+private fun copyToClipboard(context: Context, text: String) {
+    context.getSystemService(ClipboardManager::class.java)
+        .setPrimaryClip(ClipData.newPlainText("message", text))
 }
 
 /** One inline image: loads (download + cache + decode) off-thread via [load],
