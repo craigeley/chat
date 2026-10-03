@@ -32,6 +32,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -53,6 +54,7 @@ import com.craigeley.chat.ui.theme.ChatType
 @Composable
 fun NewMessageScreen(viewModel: ChatViewModel) {
     val state by viewModel.state.collectAsState()
+    val keyboard = LocalSoftwareKeyboardController.current
     var query by remember { mutableStateOf("") }
     var recipients by remember { mutableStateOf<List<Contact>>(emptyList()) }
     // Recipients the server says can't receive iMessages (Private-API check; empty
@@ -158,22 +160,16 @@ fun NewMessageScreen(viewModel: ChatViewModel) {
         }
 
         val canSend = recipients.isNotEmpty() && blocked.isEmpty()
-        val sendNew: (String) -> Unit = { viewModel.sendNewMessage(recipients.map { it.address }, it) }
+        // Drop the keyboard on send: with it up there's no room for the status line
+        // under the compose bar (two recipients already fill what's left).
+        val sendNew: (String) -> Unit = {
+            keyboard?.hide()
+            viewModel.sendNewMessage(recipients.map { it.address }, it)
+        }
         val pickForCompose: (() -> Unit)? = if (recipients.size == 1) {
             { pickImage.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) }
         } else {
             null
-        }
-
-        // Status ("Sending…", "Not sent: …") sits above the compose bar: below it,
-        // the keyboard (still up right after Send) covers it.
-        state.message?.let {
-            Text(
-                text = it,
-                style = ChatType.hint,
-                color = ChatColors.onSurfaceVariant,
-                modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
-            )
         }
 
         val q = query.trim()
@@ -229,6 +225,15 @@ fun NewMessageScreen(viewModel: ChatViewModel) {
                 onPickImage = pickForCompose,
                 showTopDivider = false,
                 restoreText = state.newDraft,
+            )
+        }
+
+        state.message?.let {
+            Text(
+                text = it,
+                style = ChatType.hint,
+                color = ChatColors.onSurfaceVariant,
+                modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
             )
         }
     }

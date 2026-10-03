@@ -3,6 +3,8 @@ package com.craigeley.chat
 import android.app.Application
 import android.content.ActivityNotFoundException
 import android.content.Intent
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.net.Uri
 import android.provider.OpenableColumns
 import androidx.compose.ui.graphics.ImageBitmap
@@ -886,6 +888,18 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    /** Whether any non-VPN network offers internet — the check [SocketService]'s
+     *  physical-network callback makes, done once. */
+    private fun hasPhysicalNetwork(): Boolean {
+        val cm = app.getSystemService(ConnectivityManager::class.java) ?: return true
+        @Suppress("DEPRECATION")
+        return cm.allNetworks.any { n ->
+            val caps = cm.getNetworkCapabilities(n) ?: return@any false
+            caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+                !caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
+        }
+    }
+
     /** Normalizes a picked address to the E.164 (or lowercased email) handle that
      *  iMessage keys 1:1 chat guids by. US-centric on the country code, matching the
      *  single personal account this app serves. */
@@ -939,6 +953,13 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         val isGroup = addrs.size > 1
         if (isGroup && !_state.value.privateApi) {
             _state.update { it.copy(message = "Group messaging needs the server’s Private API", newDraft = Draft(body)) }
+            return
+        }
+        // Over Tailscale with no network under it, the tunnel still accepts the
+        // connection, so the request would sit out the full read timeout and then
+        // claim it "may still send". Fail fast instead.
+        if (!hasPhysicalNetwork()) {
+            _state.update { it.copy(message = "Not sent: no connection", newDraft = Draft(body)) }
             return
         }
         val client = api ?: return
