@@ -931,16 +931,15 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /**
-     * Starts a fresh chat with [addresses] by sending [text], then opens it. One
-     * address is a 1:1 (AppleScript); two or more form a group, which the server
-     * only creates over the Private API — so a group send is gated on
-     * `state.privateApi` (the picker also hides the option, this is the backstop).
-     * The group's guid is server-assigned, so we open on whatever `newChat` returns.
+     * Starts a fresh 1:1 with [addresses] by sending [text], then opens it on the
+     * guid `newChat` returns. Groups are refused here: a BlueBubbles client can't
+     * create a brand-new group — that has to start on the Mac (LP3-60). The new-
+     * message screen already won't offer it; this is the backstop.
      *
-     * The new-message screen stays up until the server confirms (LP3-60): closing it
-     * up front dropped the user on the list, which only shows `message` when empty,
-     * so a failed group create vanished without a word. A failure now lands on the
-     * screen, recipients intact, with the text handed back via `newDraft`.
+     * The new-message screen stays up until the server confirms: closing it up
+     * front dropped the user on the list, which only shows `message` when empty, so
+     * a failed send vanished without a word. A failure now lands on the screen,
+     * recipients intact, with the text handed back via `newDraft`.
      */
     fun sendNewMessage(addresses: List<String>, text: String) {
         val addrs = addresses.map { it.trim() }.filter { it.isNotEmpty() }
@@ -950,9 +949,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             _state.update { it.copy(message = "Still sending the last message…", newDraft = Draft(body)) }
             return
         }
-        val isGroup = addrs.size > 1
-        if (isGroup && !_state.value.privateApi) {
-            _state.update { it.copy(message = "Group messaging needs the server’s Private API", newDraft = Draft(body)) }
+        if (addrs.size > 1) {
+            _state.update { it.copy(message = "Group chats can’t be started here — start it on your Mac", newDraft = Draft(body)) }
             return
         }
         // Over Tailscale with no network under it, the tunnel still accepts the
@@ -980,7 +978,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     guid = guid,
                     displayName = "",
                     participants = addrs,
-                    isGroup = isGroup,
+                    isGroup = false,
                     lastText = body,
                     lastDate = System.currentTimeMillis(),
                     lastFromMe = true,
