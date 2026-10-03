@@ -68,6 +68,7 @@ import com.craigeley.chat.ChatMessage
 import com.craigeley.chat.ChatViewModel
 import com.craigeley.chat.Contacts
 import com.craigeley.chat.Conversation
+import com.craigeley.chat.Draft
 import com.craigeley.chat.Reaction
 import com.craigeley.chat.ReactionType
 import com.craigeley.chat.ui.theme.ChatColors
@@ -287,11 +288,11 @@ fun ComposeBar(
     onPickImage: (() -> Unit)? = null,
     onTextChange: ((String) -> Unit)? = null,
     showTopDivider: Boolean = true,
-    restoreText: String? = null,
+    restoreText: Draft? = null,
 ) {
     var input by remember { mutableStateOf("") }
     LaunchedEffect(restoreText) {
-        if (restoreText != null && input.isEmpty()) input = restoreText
+        if (restoreText != null && input.isEmpty()) input = restoreText.text
     }
     Column(modifier = Modifier.fillMaxWidth()) {
         // Suppressed when the caller already draws a divider right above us (the

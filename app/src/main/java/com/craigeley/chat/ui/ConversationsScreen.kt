@@ -111,6 +111,16 @@ fun ConversationsScreen(viewModel: ChatViewModel, onOpenSettings: () -> Unit, on
             )
         }
 
+        // A new-message send that failed after the user backed out of its screen.
+        state.listNotice?.let {
+            Text(
+                text = it,
+                style = ChatType.hint,
+                color = ChatColors.onSurfaceVariant,
+                modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
+            )
+        }
+
         when {
             state.conversations.isEmpty() -> {
                 val label = when {

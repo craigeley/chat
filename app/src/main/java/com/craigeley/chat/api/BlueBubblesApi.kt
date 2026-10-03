@@ -7,6 +7,7 @@ import com.craigeley.chat.IncomingMessage
 import java.io.File
 import java.io.IOException
 import java.net.HttpURLConnection
+import java.net.SocketTimeoutException
 import java.net.URL
 import java.net.URLEncoder
 import org.json.JSONArray
@@ -593,6 +594,14 @@ class BlueBubblesApi(private val baseUrl: String, private val password: String) 
         // No disconnect(): closing the stream after a full read returns the socket
         // to the keep-alive pool; disconnect() would evict it and every call over
         // the Tailscale tunnel would pay a fresh TLS handshake (LP3-22).
+        // Connect up front so a connect timeout surfaces as a plain IOException: a
+        // SocketTimeoutException out of here means the request went out and the
+        // reply timed out, which chat/new reads as "may still send".
+        try {
+            conn.connect()
+        } catch (e: SocketTimeoutException) {
+            throw IOException("couldn’t reach the server", e)
+        }
         if (body != null) {
             conn.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
         }

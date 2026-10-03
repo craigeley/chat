@@ -165,6 +165,17 @@ fun NewMessageScreen(viewModel: ChatViewModel) {
             null
         }
 
+        // Status ("Sending…", "Not sent: …") sits above the compose bar: below it,
+        // the keyboard (still up right after Send) covers it.
+        state.message?.let {
+            Text(
+                text = it,
+                style = ChatType.hint,
+                color = ChatColors.onSurfaceVariant,
+                modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
+            )
+        }
+
         val q = query.trim()
         if (q.isNotEmpty()) {
             // Searching: contact matches fill the space; the compose bar (when a
@@ -218,16 +229,6 @@ fun NewMessageScreen(viewModel: ChatViewModel) {
                 onPickImage = pickForCompose,
                 showTopDivider = false,
                 restoreText = state.newDraft,
-            )
-        }
-
-        state.message?.let {
-            Text(
-                text = it,
-                style = ChatType.hint,
-                color = ChatColors.onSurfaceDim,
-                textAlign = TextAlign.Center,
-                modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
             )
         }
     }
