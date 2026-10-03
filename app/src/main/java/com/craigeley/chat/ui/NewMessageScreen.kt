@@ -43,7 +43,8 @@ import com.craigeley.chat.ui.theme.ChatType
 
 /**
  * Start a new conversation: type into "To" to search the address book (by name,
- * number, or email) or enter a raw address, then tap to add a recipient. Each
+ * number, or email) or enter a raw address, then tap to add a recipient. Named
+ * group chats match too (LP3-63); tapping one opens its existing thread. Each
  * chosen recipient becomes a removable chip. Only a 1:1 can be started here: a
  * BlueBubbles client can't create a brand-new group (LP3-60), so a second chip
  * swaps the compose bar for a note to start the group on the Mac. Type the first
@@ -192,7 +193,32 @@ fun NewMessageScreen(viewModel: ChatViewModel) {
                     .filter { it.name.contains(q, true) || it.address.contains(q, true) }
                     .take(40)
             }
+            val groupMatches = remember(q, state.groupList) {
+                state.groupList.filter { it.displayName.contains(q, true) }.take(10)
+            }
             LazyColumn(modifier = Modifier.weight(1f).fillMaxWidth()) {
+                // Existing named groups first: picking one jumps straight into its
+                // thread (a group can't be created here, but it can be sent to).
+                items(groupMatches, key = { "group:" + it.guid }) { group ->
+                    Column(modifier = Modifier.fillMaxWidth().padding(vertical = 10.dp)) {
+                        HapticText(
+                            text = group.displayName,
+                            style = ChatType.body,
+                            color = ChatColors.onSurface,
+                            textAlign = TextAlign.Start,
+                            maxLines = 1,
+                            modifier = Modifier.fillMaxWidth(),
+                            onClick = { viewModel.openGroup(group) },
+                        )
+                        Text(
+                            text = group.participants.joinToString(", ") { state.contacts.sender(it) },
+                            style = ChatType.hint,
+                            color = ChatColors.onSurfaceDim,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                }
                 items(matches, key = { it.address }) { contact ->
                     Column(modifier = Modifier.fillMaxWidth().padding(vertical = 10.dp)) {
                         HapticText(

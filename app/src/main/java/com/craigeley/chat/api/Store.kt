@@ -2,6 +2,8 @@ package com.craigeley.chat.api
 
 import android.content.Context
 import com.craigeley.chat.Contacts
+import com.craigeley.chat.Conversation
+import org.json.JSONArray
 import org.json.JSONObject
 
 /**
@@ -19,6 +21,7 @@ object Store {
     private const val KEY_BASE_URL = "base_url"    // the server URL, set at setup
     private const val KEY_PRIVATE_API = "private_api" // server's Private API live?
     private const val KEY_LAST_SEEN = "last_seen_date" // newest message date seen (catch-up cursor)
+    private const val KEY_GROUPS = "named_groups"  // named group chats for New Message search, JSON
 
     /** The configured BlueBubbles Server URL, or null if setup hasn't run yet. */
     fun baseUrl(context: Context): String? =
@@ -87,6 +90,49 @@ object Store {
         if (date <= 0L) return
         val prefs = prefs(context)
         if (date > prefs.getLong(KEY_LAST_SEEN, 0L)) prefs.edit().putLong(KEY_LAST_SEEN, date).apply()
+    }
+
+    /**
+     * The named group chats New Message searches (LP3-63), so a search right after
+     * launch works before [com.craigeley.chat.api.BlueBubblesApi.namedGroups] —
+     * a few-MB fetch — comes back. Only what the picker and
+     * [com.craigeley.chat.ChatViewModel.openGroup]
+     * need: name, participants, guids (live room first), recency.
+     */
+    fun setGroups(context: Context, groups: List<Conversation>) {
+        val arr = JSONArray()
+        for (g in groups) {
+            arr.put(
+                JSONObject()
+                    .put("name", g.displayName)
+                    .put("participants", JSONArray(g.participants))
+                    .put("guids", JSONArray(g.guids))
+                    .put("lastDate", g.lastDate),
+            )
+        }
+        prefs(context).edit().putString(KEY_GROUPS, arr.toString()).apply()
+    }
+
+    fun groups(context: Context): List<Conversation> {
+        val json = prefs(context).getString(KEY_GROUPS, null) ?: return emptyList()
+        return runCatching {
+            val arr = JSONArray(json)
+            (0 until arr.length()).map { i ->
+                val o = arr.getJSONObject(i)
+                val parts = o.getJSONArray("participants").let { p -> (0 until p.length()).map(p::getString) }
+                val guids = o.getJSONArray("guids").let { g -> (0 until g.length()).map(g::getString) }
+                Conversation(
+                    guid = guids.first(),
+                    displayName = o.getString("name"),
+                    participants = parts,
+                    isGroup = true,
+                    lastText = "",
+                    lastDate = o.optLong("lastDate"),
+                    lastFromMe = false,
+                    guids = guids,
+                )
+            }
+        }.getOrDefault(emptyList())
     }
 
     /** Sign out: wipe the stored password. */

@@ -13,6 +13,9 @@ import java.net.URLEncoder
 import org.json.JSONArray
 import org.json.JSONObject
 
+/** Page size for `chat/query` in [BlueBubblesApi.namedGroups]. */
+private const val CHAT_PAGE = 1000
+
 /** Carries the HTTP status so the ViewModel can treat 401/403 as a bad password. */
 class ApiException(val code: Int, message: String) : IOException(message) {
     val isAuthError: Boolean get() = code == 401 || code == 403
@@ -478,6 +481,46 @@ class BlueBubblesApi(private val baseUrl: String, private val password: String) 
         }
         val guid = dataObject(resp)?.optString("guid")
         return guid?.takeIf { it.isNotBlank() } ?: throw IOException("new chat: no guid returned")
+    }
+
+    /**
+     * Every named group chat on the Mac — not just the recently active ones the
+     * sweep sees — so New Message can find a group by name (LP3-63). Pages
+     * `chat/query` (a few MB across ~2.5k chats, so callers fetch it once and
+     * cache) and keeps style-43 chats with a display name. Forked sibling rooms
+     * collapse as in [deriveConversations]: one entry per name + participant set,
+     * guids ordered so the live room (newest non-reaction last message) is first.
+     */
+    fun namedGroups(): List<Conversation> {
+        val rooms = ArrayList<Pair<Conversation, Long>>() // room → its newest real-message date
+        var offset = 0
+        while (true) {
+            val body = JSONObject()
+                .put("limit", CHAT_PAGE)
+                .put("offset", offset)
+                .put("with", JSONArray().put("participants").put("lastmessage"))
+            val text = requestChecked("POST", "/api/v1/chat/query", body, what = "chat/query")
+            val data = JSONObject(text).optJSONArray("data") ?: JSONArray()
+            for (i in 0 until data.length()) {
+                val chat = data.getJSONObject(i)
+                val name = chat.optString("displayName").takeIf { it.isNotBlank() && it != "null" }
+                if (chat.optInt("style") != 43 || name == null) continue
+                val last = chat.optJSONObject("lastMessage")?.let { runCatching { parseMessage(it) }.getOrNull() }
+                val room = chatToConversation(
+                    chat, chat.optString("guid"), last?.previewText ?: "", last?.date ?: 0L, last?.fromMe ?: false,
+                )
+                rooms.add(room to (last?.takeIf { !it.isReaction }?.date ?: 0L))
+            }
+            offset += data.length()
+            if (data.length() < CHAT_PAGE) break
+        }
+        val byIdentity = LinkedHashMap<String, MutableList<Pair<Conversation, Long>>>()
+        for (r in rooms) byIdentity.getOrPut(groupIdentity(r.first) ?: r.first.guid) { mutableListOf() }.add(r)
+        return byIdentity.values.map { siblings ->
+            val display = siblings.maxBy { it.first.lastDate }.first
+            val sendOrder = siblings.sortedByDescending { it.second }.map { it.first.guid }
+            display.copy(guid = sendOrder.first(), guids = sendOrder)
+        }.sortedByDescending { it.lastDate }
     }
 
     /**
