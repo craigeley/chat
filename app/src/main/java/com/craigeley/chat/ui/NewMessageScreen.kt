@@ -32,6 +32,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -43,16 +44,16 @@ import com.craigeley.chat.ui.theme.ChatType
 /**
  * Start a new conversation: type into "To" to search the address book (by name,
  * number, or email) or enter a raw address, then tap to add a recipient. Each
- * chosen recipient becomes a removable chip; one recipient is a 1:1, two or more
- * a group (group sending is gated on the server's Private API — see the ViewModel).
- * Type the first message and send; that creates the chat (`chat/new`) and drops
- * into the thread. The photo picker is offered for 1:1 only (the group create path
- * can't take a constructed guid for the attachment).
+ * chosen recipient becomes a removable chip. Only a 1:1 can be started here: a
+ * BlueBubbles client can't create a brand-new group (LP3-60), so a second chip
+ * swaps the compose bar for a note to start the group on the Mac. Type the first
+ * message and send; that creates the chat (`chat/new`) and drops into the thread.
  */
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun NewMessageScreen(viewModel: ChatViewModel) {
     val state by viewModel.state.collectAsState()
+    val keyboard = LocalSoftwareKeyboardController.current
     var query by remember { mutableStateOf("") }
     var recipients by remember { mutableStateOf<List<Contact>>(emptyList()) }
     // Recipients the server says can't receive iMessages (Private-API check; empty
@@ -157,8 +158,25 @@ fun NewMessageScreen(viewModel: ChatViewModel) {
             )
         }
 
-        val canSend = recipients.isNotEmpty() && blocked.isEmpty()
-        val sendNew: (String) -> Unit = { viewModel.sendNewMessage(recipients.map { it.address }, it) }
+        // Groups can't be created from a BlueBubbles client — only on the Mac, or by
+        // someone else adding you (LP3-60). Say so instead of offering a doomed send.
+        val isGroup = recipients.size > 1
+        if (isGroup) {
+            Text(
+                text = "Group chats can’t be started here. Start it on your Mac and it’ll show up in the list.",
+                style = ChatType.hint,
+                color = ChatColors.onSurfaceVariant,
+                modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+            )
+        }
+
+        val canSend = recipients.isNotEmpty() && blocked.isEmpty() && !isGroup
+        // Drop the keyboard on send: with it up there's no room for the status line
+        // under the compose bar (two recipients already fill what's left).
+        val sendNew: (String) -> Unit = {
+            keyboard?.hide()
+            viewModel.sendNewMessage(recipients.map { it.address }, it)
+        }
         val pickForCompose: (() -> Unit)? = if (recipients.size == 1) {
             { pickImage.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) }
         } else {
@@ -209,19 +227,23 @@ fun NewMessageScreen(viewModel: ChatViewModel) {
                     }
                 }
             }
-            if (canSend) ComposeBar(onSend = sendNew, onPickImage = pickForCompose)
+            if (canSend) ComposeBar(onSend = sendNew, onPickImage = pickForCompose, restoreText = state.newDraft)
         } else if (canSend) {
             // Composing: the message field hugs the "To" divider (no gap, no second
             // line) so it's right under the recipient; the empty room falls below it.
-            ComposeBar(onSend = sendNew, onPickImage = pickForCompose, showTopDivider = false)
+            ComposeBar(
+                onSend = sendNew,
+                onPickImage = pickForCompose,
+                showTopDivider = false,
+                restoreText = state.newDraft,
+            )
         }
 
         state.message?.let {
             Text(
                 text = it,
                 style = ChatType.hint,
-                color = ChatColors.onSurfaceDim,
-                textAlign = TextAlign.Center,
+                color = ChatColors.onSurfaceVariant,
                 modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
             )
         }

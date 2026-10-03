@@ -7,6 +7,7 @@ import com.craigeley.chat.IncomingMessage
 import java.io.File
 import java.io.IOException
 import java.net.HttpURLConnection
+import java.net.SocketTimeoutException
 import java.net.URL
 import java.net.URLEncoder
 import org.json.JSONArray
@@ -457,6 +458,12 @@ class BlueBubblesApi(private val baseUrl: String, private val password: String) 
      * caller must gate group creation on the server's Private API being live. The
      * server assigns the group its own guid (`any;+;<hex>`, style 43), unguessable
      * client-side, so callers must use the returned guid rather than construct one.
+     *
+     * The server holds the response until the first message lands in chat.db (it
+     * waits up to 30s on top of the helper's own round trip), so this gets a longer
+     * read timeout than [request]'s default — at 20s a slow group create timed out
+     * client-side. Failures carry the server's own reason (e.g. "Failed to create
+     * chat via the Private API!") rather than a bare status code.
      */
     fun newChat(addresses: List<String>, text: String, service: String = "iMessage"): String {
         val isGroup = addresses.size > 1
@@ -465,7 +472,10 @@ class BlueBubblesApi(private val baseUrl: String, private val password: String) 
             .put("message", text)
             .put("service", service)
             .put("method", if (isGroup) "private-api" else "apple-script")
-        val resp = requestChecked("POST", "/api/v1/chat/new", body, what = "new chat")
+        val (code, resp) = request("POST", "/api/v1/chat/new", body, readTimeoutMs = 90_000)
+        if (code !in 200..299) {
+            throw ApiException(code, serverError(resp) ?: "new chat failed ($code)")
+        }
         val guid = dataObject(resp)?.optString("guid")
         return guid?.takeIf { it.isNotBlank() } ?: throw IOException("new chat: no guid returned")
     }
@@ -553,11 +563,18 @@ class BlueBubblesApi(private val baseUrl: String, private val password: String) 
     private fun dataObject(resp: String): JSONObject? =
         runCatching { JSONObject(resp).optJSONObject("data") }.getOrNull()
 
+    /** The reason in a BlueBubbles error body (`{"error":{"message":…}}`), if any. */
+    private fun serverError(resp: String): String? =
+        runCatching {
+            JSONObject(resp).optJSONObject("error")?.optString("message")?.takeIf { it.isNotBlank() }
+        }.getOrNull()
+
     private fun request(
         method: String,
         path: String,
         body: JSONObject?,
         extraQuery: String? = null,
+        readTimeoutMs: Int = 20_000,
     ): Pair<Int, String> {
         val url = buildString {
             append(baseUrl).append(path)
@@ -567,7 +584,7 @@ class BlueBubblesApi(private val baseUrl: String, private val password: String) 
         val conn = (URL(url).openConnection() as HttpURLConnection).apply {
             requestMethod = method
             connectTimeout = 15_000
-            readTimeout = 20_000
+            readTimeout = readTimeoutMs
             setRequestProperty("Accept", "application/json")
             if (body != null) {
                 doOutput = true
@@ -577,6 +594,14 @@ class BlueBubblesApi(private val baseUrl: String, private val password: String) 
         // No disconnect(): closing the stream after a full read returns the socket
         // to the keep-alive pool; disconnect() would evict it and every call over
         // the Tailscale tunnel would pay a fresh TLS handshake (LP3-22).
+        // Connect up front so a connect timeout surfaces as a plain IOException: a
+        // SocketTimeoutException out of here means the request went out and the
+        // reply timed out, which chat/new reads as "may still send".
+        try {
+            conn.connect()
+        } catch (e: SocketTimeoutException) {
+            throw IOException("couldn’t reach the server", e)
+        }
         if (body != null) {
             conn.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
         }

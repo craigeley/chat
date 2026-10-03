@@ -3,6 +3,8 @@ package com.craigeley.chat
 import android.app.Application
 import android.content.ActivityNotFoundException
 import android.content.Intent
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.net.Uri
 import android.provider.OpenableColumns
 import androidx.compose.ui.graphics.ImageBitmap
@@ -16,6 +18,7 @@ import com.craigeley.chat.socket.AppForeground
 import com.craigeley.chat.socket.SocketBus
 import com.craigeley.chat.socket.SocketService
 import java.io.File
+import java.net.SocketTimeoutException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -57,11 +60,18 @@ data class UiState(
     val contacts: Contacts = Contacts(),       // address → name, from the server's address book
     val contactList: List<Contact> = emptyList(), // searchable recipients for a new message
     val composingNew: Boolean = false,         // the "New message" compose screen is open
+    val sendingNew: Boolean = false,           // a new-message send (chat/new) is in flight
+    val newDraft: Draft? = null,               // text of a failed new-message send, to restore
     val privateApi: Boolean = false,           // server's Private API live → tapbacks available
     val typingChatGuid: String? = null,        // chat whose other party is currently typing
     val connected: Boolean = true,             // live socket up (false only after a sustained drop)
     val message: String? = null,               // transient status / error line
+    val listNotice: String? = null,            // a new-message failure after backing out to the list
 )
+
+/** A failed send's text, handed back to the compose field. A plain class, so each
+ *  failure is a new key even when the text repeats and the field gets it back again. */
+class Draft(val text: String)
 
 /**
  * Single source of truth for the BlueBubbles client. Owns password setup, the
@@ -94,6 +104,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private var deltaJob: Job? = null
     private var offlineHintJob: Job? = null
     private var lastLoadAt = 0L // wall-clock of the last successful list load
+    @Volatile private var newSendSeq = 0 // bumped per new-message send and on leaving the screen
 
     // The rolling sweep the conversation list derives from (the newest ~SWEEP_LIMIT
     // messages, each with its embedded chat objects). Kept so a delta refresh can
@@ -341,6 +352,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 open = conversation,
                 messages = cached?.let(::foldReactions) ?: emptyList(),
                 threadLoading = cached == null,
+                listNotice = null,
             )
         }
         conversation.guids.forEach { markReadIfPrivate(it) }
@@ -868,8 +880,23 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 open(convo)     // land in the new thread (fetch pulls the sent image)
                 deltaRefresh()  // and pull it into the conversation list
             } catch (t: Throwable) {
-                _state.update { it.copy(message = t.message ?: "Couldn’t send image") }
+                // The new-message screen is already closed, and the list only shows
+                // `message` when empty — so the failure goes in the list's notice line.
+                val text = "Photo not sent: " + (t.message ?: "couldn’t send image")
+                _state.update { it.copy(message = null, listNotice = text) }
             }
+        }
+    }
+
+    /** Whether any non-VPN network offers internet — the check [SocketService]'s
+     *  physical-network callback makes, done once. */
+    private fun hasPhysicalNetwork(): Boolean {
+        val cm = app.getSystemService(ConnectivityManager::class.java) ?: return true
+        @Suppress("DEPRECATION")
+        return cm.allNetworks.any { n ->
+            val caps = cm.getNetworkCapabilities(n) ?: return@any false
+            caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+                !caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
         }
     }
 
@@ -890,37 +917,68 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     // ---- New message ------------------------------------------------------
 
-    fun startNewMessage() = _state.update { it.copy(composingNew = true, message = null) }
+    // Both bump newSendSeq so a send still in flight knows the screen it came from
+    // is gone. Neither clears sendingNew: that stays up until the request returns, so
+    // a second send can't start alongside it.
+    fun startNewMessage() {
+        newSendSeq++
+        _state.update { it.copy(composingNew = true, newDraft = null, message = null, listNotice = null) }
+    }
 
-    fun cancelNewMessage() = _state.update { it.copy(composingNew = false, message = null) }
+    fun cancelNewMessage() {
+        newSendSeq++
+        _state.update { it.copy(composingNew = false, newDraft = null, message = null) }
+    }
 
     /**
-     * Starts a fresh chat with [addresses] by sending [text], then opens it. One
-     * address is a 1:1 (AppleScript); two or more form a group, which the server
-     * only creates over the Private API — so a group send is gated on
-     * `state.privateApi` (the picker also hides the option, this is the backstop).
-     * The group's guid is server-assigned, so we open on whatever `newChat` returns.
+     * Starts a fresh 1:1 with [addresses] by sending [text], then opens it on the
+     * guid `newChat` returns. Groups are refused here: a BlueBubbles client can't
+     * create a brand-new group — that has to start on the Mac (LP3-60). The new-
+     * message screen already won't offer it; this is the backstop.
+     *
+     * The new-message screen stays up until the server confirms: closing it up
+     * front dropped the user on the list, which only shows `message` when empty, so
+     * a failed send vanished without a word. A failure now lands on the screen,
+     * recipients intact, with the text handed back via `newDraft`.
      */
     fun sendNewMessage(addresses: List<String>, text: String) {
         val addrs = addresses.map { it.trim() }.filter { it.isNotEmpty() }
         val body = text.trim()
         if (addrs.isEmpty() || body.isEmpty()) return
-        val isGroup = addrs.size > 1
-        if (isGroup && !_state.value.privateApi) {
-            _state.update { it.copy(message = "Group messaging needs the server’s Private API") }
+        if (_state.value.sendingNew) {
+            _state.update { it.copy(message = "Still sending the last message…", newDraft = Draft(body)) }
             return
         }
-        _state.update { it.copy(composingNew = false, message = "Sending…") }
+        if (addrs.size > 1) {
+            _state.update { it.copy(message = "Group chats can’t be started here — start it on your Mac", newDraft = Draft(body)) }
+            return
+        }
+        // Over Tailscale with no network under it, the tunnel still accepts the
+        // connection, so the request would sit out the full read timeout and then
+        // claim it "may still send". Fail fast instead.
+        if (!hasPhysicalNetwork()) {
+            _state.update { it.copy(message = "Not sent: no connection", newDraft = Draft(body)) }
+            return
+        }
+        val client = api ?: return
+        val seq = ++newSendSeq
+        _state.update { it.copy(sendingNew = true, newDraft = null, message = "Sending…") }
         viewModelScope.launch(Dispatchers.IO) {
-            val client = api ?: return@launch
             try {
                 val guid = client.newChat(addrs, body)
+                if (seq != newSendSeq) {
+                    // Left the screen mid-send: it went out, so just surface it in the list.
+                    _state.update { it.copy(sendingNew = false) }
+                    deltaRefresh()
+                    return@launch
+                }
+                _state.update { it.copy(composingNew = false, sendingNew = false) }
                 messageCache.remove(guid)
                 val convo = Conversation(
                     guid = guid,
                     displayName = "",
                     participants = addrs,
-                    isGroup = isGroup,
+                    isGroup = false,
                     lastText = body,
                     lastDate = System.currentTimeMillis(),
                     lastFromMe = true,
@@ -929,7 +987,24 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 open(convo)     // land the user in the new thread
                 deltaRefresh()  // and pull it into the conversation list
             } catch (t: Throwable) {
-                _state.update { it.copy(message = t.message ?: "Couldn’t start the message") }
+                if (t is ApiException && t.isAuthError) return@launch handleError(t)
+                // A read timeout means the request reached the server, which may still
+                // be working on it — say so rather than invite a retry that double-sends,
+                // and pull the list in case it landed. (A connect timeout never gets
+                // here as a SocketTimeoutException: BlueBubblesApi rewraps it.)
+                val maybeSent = t is SocketTimeoutException
+                val text = if (maybeSent) {
+                    "No reply from the server — it may still send. Check the list before retrying."
+                } else {
+                    "Not sent: " + (t.message ?: "couldn’t start the message")
+                }
+                if (seq == newSendSeq) {
+                    _state.update { it.copy(sendingNew = false, newDraft = Draft(body), message = text) }
+                } else {
+                    // Backed out to the list, which only shows `message` when empty.
+                    _state.update { it.copy(sendingNew = false, listNotice = text) }
+                }
+                if (maybeSent) deltaRefresh()
             }
         }
     }
