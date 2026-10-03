@@ -99,6 +99,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         UiState(
             isConfigured = api != null,
             privateApi = Store.privateApi(application),
+            // Seeded from the persisted copies so names and the group search work
+            // before (or without) the first list load.
+            contacts = Store.contacts(application),
             groupList = Store.groups(application),
         ),
     )
