@@ -59,6 +59,7 @@ data class UiState(
     val threadLoading: Boolean = false,
     val contacts: Contacts = Contacts(),       // address → name, from the server's address book
     val contactList: List<Contact> = emptyList(), // searchable recipients for a new message
+    val groupList: List<Conversation> = emptyList(), // named group chats, searchable on New Message
     val composingNew: Boolean = false,         // the "New message" compose screen is open
     val sendingNew: Boolean = false,           // a new-message send (chat/new) is in flight
     val newDraft: Draft? = null,               // text of a failed new-message send, to restore
@@ -95,7 +96,14 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private val _state = MutableStateFlow(
-        UiState(isConfigured = api != null, privateApi = Store.privateApi(application)),
+        UiState(
+            isConfigured = api != null,
+            privateApi = Store.privateApi(application),
+            // Seeded from the persisted copies so names and the group search work
+            // before (or without) the first list load.
+            contacts = Store.contacts(application),
+            groupList = Store.groups(application),
+        ),
     )
     val state: StateFlow<UiState> = _state
 
@@ -105,6 +113,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private var offlineHintJob: Job? = null
     private var lastLoadAt = 0L // wall-clock of the last successful list load
     @Volatile private var newSendSeq = 0 // bumped per new-message send and on leaving the screen
+    private var groupsFetched = false    // namedGroups() ran (or is running) this session
 
     // The rolling sweep the conversation list derives from (the newest ~SWEEP_LIMIT
     // messages, each with its embedded chat objects). Kept so a delta refresh can
@@ -923,6 +932,37 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     fun startNewMessage() {
         newSendSeq++
         _state.update { it.copy(composingNew = true, newDraft = null, message = null, listNotice = null) }
+        loadGroups()
+    }
+
+    /** Fetches every named group for New Message's search, once per session; the
+     *  persisted list covers the wait (LP3-63). */
+    private fun loadGroups() {
+        val client = api ?: return
+        if (groupsFetched) return
+        groupsFetched = true
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching { client.namedGroups() }
+                .onSuccess { groups ->
+                    Store.setGroups(app, groups)
+                    _state.update { it.copy(groupList = groups) }
+                }
+                .onFailure { groupsFetched = false } // try again next time New Message opens
+        }
+    }
+
+    /**
+     * Opens an existing group picked by name on New Message. A group can't be
+     * *created* from here (LP3-60), but sending into one that exists works. When
+     * the list already has it, that copy is used — its send target comes from the
+     * sweep — with any older sibling rooms the full fetch found added to its thread.
+     */
+    fun openGroup(group: Conversation) {
+        newSendSeq++
+        val listed = _state.value.conversations.firstOrNull { c -> c.guids.any { it in group.guids } }
+        val convo = listed?.copy(guids = listed.guids + (group.guids - listed.guids.toSet())) ?: group
+        _state.update { it.copy(composingNew = false, newDraft = null, message = null) }
+        open(convo)
     }
 
     fun cancelNewMessage() {
@@ -1268,6 +1308,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         loadJob?.cancel()
         threadJob?.cancel()
         api = null
+        groupsFetched = false
         stopSocket()
         Store.signOut(app)
         _state.value = UiState(isConfigured = false, message = message)
