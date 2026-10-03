@@ -457,6 +457,12 @@ class BlueBubblesApi(private val baseUrl: String, private val password: String) 
      * caller must gate group creation on the server's Private API being live. The
      * server assigns the group its own guid (`any;+;<hex>`, style 43), unguessable
      * client-side, so callers must use the returned guid rather than construct one.
+     *
+     * The server holds the response until the first message lands in chat.db (it
+     * waits up to 30s on top of the helper's own round trip), so this gets a longer
+     * read timeout than [request]'s default — at 20s a slow group create timed out
+     * client-side. Failures carry the server's own reason (e.g. "Failed to create
+     * chat via the Private API!") rather than a bare status code.
      */
     fun newChat(addresses: List<String>, text: String, service: String = "iMessage"): String {
         val isGroup = addresses.size > 1
@@ -465,7 +471,10 @@ class BlueBubblesApi(private val baseUrl: String, private val password: String) 
             .put("message", text)
             .put("service", service)
             .put("method", if (isGroup) "private-api" else "apple-script")
-        val resp = requestChecked("POST", "/api/v1/chat/new", body, what = "new chat")
+        val (code, resp) = request("POST", "/api/v1/chat/new", body, readTimeoutMs = 90_000)
+        if (code !in 200..299) {
+            throw ApiException(code, serverError(resp) ?: "new chat failed ($code)")
+        }
         val guid = dataObject(resp)?.optString("guid")
         return guid?.takeIf { it.isNotBlank() } ?: throw IOException("new chat: no guid returned")
     }
@@ -553,11 +562,18 @@ class BlueBubblesApi(private val baseUrl: String, private val password: String) 
     private fun dataObject(resp: String): JSONObject? =
         runCatching { JSONObject(resp).optJSONObject("data") }.getOrNull()
 
+    /** The reason in a BlueBubbles error body (`{"error":{"message":…}}`), if any. */
+    private fun serverError(resp: String): String? =
+        runCatching {
+            JSONObject(resp).optJSONObject("error")?.optString("message")?.takeIf { it.isNotBlank() }
+        }.getOrNull()
+
     private fun request(
         method: String,
         path: String,
         body: JSONObject?,
         extraQuery: String? = null,
+        readTimeoutMs: Int = 20_000,
     ): Pair<Int, String> {
         val url = buildString {
             append(baseUrl).append(path)
@@ -567,7 +583,7 @@ class BlueBubblesApi(private val baseUrl: String, private val password: String) 
         val conn = (URL(url).openConnection() as HttpURLConnection).apply {
             requestMethod = method
             connectTimeout = 15_000
-            readTimeout = 20_000
+            readTimeout = readTimeoutMs
             setRequestProperty("Accept", "application/json")
             if (body != null) {
                 doOutput = true

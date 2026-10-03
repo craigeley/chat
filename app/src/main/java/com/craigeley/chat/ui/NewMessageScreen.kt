@@ -209,11 +209,16 @@ fun NewMessageScreen(viewModel: ChatViewModel) {
                     }
                 }
             }
-            if (canSend) ComposeBar(onSend = sendNew, onPickImage = pickForCompose)
+            if (canSend) ComposeBar(onSend = sendNew, onPickImage = pickForCompose, restoreText = state.newDraft)
         } else if (canSend) {
             // Composing: the message field hugs the "To" divider (no gap, no second
             // line) so it's right under the recipient; the empty room falls below it.
-            ComposeBar(onSend = sendNew, onPickImage = pickForCompose, showTopDivider = false)
+            ComposeBar(
+                onSend = sendNew,
+                onPickImage = pickForCompose,
+                showTopDivider = false,
+                restoreText = state.newDraft,
+            )
         }
 
         state.message?.let {

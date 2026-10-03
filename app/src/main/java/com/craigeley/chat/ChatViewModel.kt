@@ -16,6 +16,7 @@ import com.craigeley.chat.socket.AppForeground
 import com.craigeley.chat.socket.SocketBus
 import com.craigeley.chat.socket.SocketService
 import java.io.File
+import java.net.SocketTimeoutException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -57,6 +58,8 @@ data class UiState(
     val contacts: Contacts = Contacts(),       // address → name, from the server's address book
     val contactList: List<Contact> = emptyList(), // searchable recipients for a new message
     val composingNew: Boolean = false,         // the "New message" compose screen is open
+    val sendingNew: Boolean = false,           // a new-message send (chat/new) is in flight
+    val newDraft: String? = null,              // text of a failed new-message send, to restore
     val privateApi: Boolean = false,           // server's Private API live → tapbacks available
     val typingChatGuid: String? = null,        // chat whose other party is currently typing
     val connected: Boolean = true,             // live socket up (false only after a sustained drop)
@@ -890,9 +893,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     // ---- New message ------------------------------------------------------
 
-    fun startNewMessage() = _state.update { it.copy(composingNew = true, message = null) }
+    fun startNewMessage() =
+        _state.update { it.copy(composingNew = true, sendingNew = false, newDraft = null, message = null) }
 
-    fun cancelNewMessage() = _state.update { it.copy(composingNew = false, message = null) }
+    fun cancelNewMessage() =
+        _state.update { it.copy(composingNew = false, sendingNew = false, newDraft = null, message = null) }
 
     /**
      * Starts a fresh chat with [addresses] by sending [text], then opens it. One
@@ -900,21 +905,33 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
      * only creates over the Private API — so a group send is gated on
      * `state.privateApi` (the picker also hides the option, this is the backstop).
      * The group's guid is server-assigned, so we open on whatever `newChat` returns.
+     *
+     * The new-message screen stays up until the server confirms (LP3-60): closing it
+     * up front dropped the user on the list, which only shows `message` when empty,
+     * so a failed group create vanished without a word. A failure now lands on the
+     * screen, recipients intact, with the text handed back via `newDraft`.
      */
     fun sendNewMessage(addresses: List<String>, text: String) {
         val addrs = addresses.map { it.trim() }.filter { it.isNotEmpty() }
         val body = text.trim()
-        if (addrs.isEmpty() || body.isEmpty()) return
+        if (addrs.isEmpty() || body.isEmpty() || _state.value.sendingNew) return
         val isGroup = addrs.size > 1
         if (isGroup && !_state.value.privateApi) {
-            _state.update { it.copy(message = "Group messaging needs the server’s Private API") }
+            _state.update { it.copy(message = "Group messaging needs the server’s Private API", newDraft = body) }
             return
         }
-        _state.update { it.copy(composingNew = false, message = "Sending…") }
+        _state.update { it.copy(sendingNew = true, newDraft = null, message = "Sending…") }
         viewModelScope.launch(Dispatchers.IO) {
             val client = api ?: return@launch
             try {
                 val guid = client.newChat(addrs, body)
+                if (!_state.value.composingNew) {
+                    // Backed out mid-send: it went out, so just surface it in the list.
+                    _state.update { it.copy(sendingNew = false, message = null) }
+                    deltaRefresh()
+                    return@launch
+                }
+                _state.update { it.copy(composingNew = false, sendingNew = false) }
                 messageCache.remove(guid)
                 val convo = Conversation(
                     guid = guid,
@@ -928,8 +945,26 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 _state.update { it.copy(message = null) }
                 open(convo)     // land the user in the new thread
                 deltaRefresh()  // and pull it into the conversation list
+            } catch (t: SocketTimeoutException) {
+                // The server may still be working on it — say so rather than invite
+                // a retry that double-sends, and pull the list in case it landed.
+                _state.update {
+                    it.copy(
+                        sendingNew = false,
+                        newDraft = body,
+                        message = "No reply from the server — it may still send. Check the list before retrying.",
+                    )
+                }
+                deltaRefresh()
             } catch (t: Throwable) {
-                _state.update { it.copy(message = t.message ?: "Couldn’t start the message") }
+                if (t is ApiException && t.isAuthError) return@launch handleError(t)
+                _state.update {
+                    it.copy(
+                        sendingNew = false,
+                        newDraft = body,
+                        message = "Not sent: " + (t.message ?: "couldn’t start the message"),
+                    )
+                }
             }
         }
     }

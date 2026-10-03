@@ -279,15 +279,20 @@ private fun TypingIndicator() {
 
 /** Bottom compose row: a growing text field and a Send action. Shared with the
  *  new-message screen. When [onPickImage] is supplied (the thread, not a brand-new
- *  chat) a leading "+" opens the photo picker. */
+ *  chat) a leading "+" opens the photo picker. A non-null [restoreText] (a send
+ *  that failed after the field cleared) is put back if the field is still empty. */
 @Composable
 fun ComposeBar(
     onSend: (String) -> Unit,
     onPickImage: (() -> Unit)? = null,
     onTextChange: ((String) -> Unit)? = null,
     showTopDivider: Boolean = true,
+    restoreText: String? = null,
 ) {
     var input by remember { mutableStateOf("") }
+    LaunchedEffect(restoreText) {
+        if (restoreText != null && input.isEmpty()) input = restoreText
+    }
     Column(modifier = Modifier.fillMaxWidth()) {
         // Suppressed when the caller already draws a divider right above us (the
         // new-message screen's "To" line) — otherwise it reads as a double line.
