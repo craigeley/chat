@@ -451,6 +451,34 @@ class BlueBubblesApi(private val baseUrl: String, private val password: String) 
     }
 
     /**
+     * `POST /api/v1/chat/new` — starts a 1:1 with [address] by sending [text] as its
+     * first message (macOS Big Sur+ can't create an empty chat) and returns the chat's
+     * guid. Only for a 1:1 the conversation list doesn't have: a listed one is sent
+     * into with [send].
+     *
+     * Use [method] `private-api` whenever the Private API is live. That path has the
+     * helper create the chat and send, then finds the chat by the *message's* guid, so
+     * it holds up on macOS 26, where every chat guid is `any;…`. The `apple-script`
+     * path can't: it sends to a constructed `iMessage;-;<address>`, then waits for an
+     * echo under that guid which never comes, and holds the reply for the server's
+     * 120s timeout after the message has gone out (LP3-65). It's kept only for a
+     * server without the Private API.
+     */
+    fun newChat(address: String, text: String, method: String): String {
+        val body = JSONObject()
+            .put("addresses", JSONArray().put(address))
+            .put("message", text)
+            .put("service", "iMessage")
+            .put("method", method)
+        val (code, resp) = request("POST", "/api/v1/chat/new", body, readTimeoutMs = 60_000)
+        if (code !in 200..299) {
+            throw ApiException(code, serverError(resp) ?: "new chat failed ($code)")
+        }
+        val guid = dataObject(resp)?.optString("guid")
+        return guid?.takeIf { it.isNotBlank() } ?: throw IOException("new chat: no guid returned")
+    }
+
+    /**
      * Every named group chat on the Mac — not just the recently active ones the
      * sweep sees — so New Message can find a group by name (LP3-63). Pages
      * `chat/query` (a few MB across ~2.5k chats, so callers fetch it once and
@@ -584,6 +612,7 @@ class BlueBubblesApi(private val baseUrl: String, private val password: String) 
         path: String,
         body: JSONObject?,
         extraQuery: String? = null,
+        readTimeoutMs: Int = 20_000,
     ): Pair<Int, String> {
         val url = buildString {
             append(baseUrl).append(path)
@@ -593,7 +622,7 @@ class BlueBubblesApi(private val baseUrl: String, private val password: String) 
         val conn = (URL(url).openConnection() as HttpURLConnection).apply {
             requestMethod = method
             connectTimeout = 15_000
-            readTimeout = 20_000
+            readTimeout = readTimeoutMs
             setRequestProperty("Accept", "application/json")
             if (body != null) {
                 doOutput = true
@@ -605,7 +634,7 @@ class BlueBubblesApi(private val baseUrl: String, private val password: String) 
         // the Tailscale tunnel would pay a fresh TLS handshake (LP3-22).
         // Connect up front so a connect timeout surfaces as a plain IOException: a
         // SocketTimeoutException out of here means the request went out and the
-        // reply timed out, which a New Message send reads as "may still send".
+        // reply timed out, which chat/new reads as "may still send".
         try {
             conn.connect()
         } catch (e: SocketTimeoutException) {

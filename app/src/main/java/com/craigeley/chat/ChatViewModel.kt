@@ -857,10 +857,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }.getOrNull()
 
     /**
-     * Sends a picked image as the first message to [address] from New Message —
-     * into the 1:1 the list already has, or a constructed one (see [directTarget])
-     * that the send creates server-side — then drops into the thread and refreshes
-     * the list.
+     * Sends a picked image to [address] from New Message — into the 1:1 the list
+     * already has, or the chat.db one under a constructed guid (see
+     * [constructedDirect]) — then drops into the thread and refreshes the list.
      */
     fun sendNewImage(address: String, uri: Uri) {
         val addr = address.trim()
@@ -869,7 +868,13 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch(Dispatchers.IO) {
             val client = api ?: return@launch
             val img = readPickedImage(uri) ?: return@launch
-            val (target, method) = directTarget(addr)
+            // A chat the list doesn't have goes to its constructed guid, which the
+            // Private API resolves as long as chat.db has the chat; a never-texted
+            // address fails with a message rather than starting one (only text can,
+            // via chat/new).
+            val handle = imessageHandle(addr)
+            val target = listedDirect(handle) ?: constructedDirect(handle)
+            val method = sendMethod()
             try {
                 sendAcrossRooms(target.guid, sendTargets(target, method)) { g ->
                     client.sendAttachment(g, img.bytes, img.name, img.mime, newTempGuid(), method)
@@ -900,26 +905,22 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    /** The 1:1 with [handle] the conversation list already has, if any. */
+    private fun listedDirect(handle: String): Conversation? =
+        _state.value.conversations.firstOrNull { c ->
+            !c.isGroup && c.participants.singleOrNull()?.let(::imessageHandle) == handle
+        }
+
     /**
-     * Where a New Message send to the single [address] goes, and by which method.
-     * The 1:1 the list already has is used as-is (its own guid, the usual method).
-     * Otherwise we construct the 1:1 guid `<service>;-;<handle>` and send by
-     * AppleScript, whose fallback script texts the handle and so creates the chat
-     * (the Private API can only send into a chat that already exists).
-     *
-     * The service prefix is read off the list's own guids rather than assumed:
-     * macOS 26 keys every chat `any;…` where older releases used `iMessage;…`. A
-     * mismatched prefix still delivers, but the server then waits for the echo in
-     * a chat that never appears and holds the reply until its 120s timeout — what
-     * left `chat/new` stuck on "Sending…" (LP3-65).
+     * A 1:1 with [handle] the list doesn't have, under a constructed
+     * `<service>;-;<handle>` guid. The service prefix is read off the list's own
+     * guids rather than assumed: macOS 26 keys every chat `any;…` where older
+     * releases used `iMessage;…`.
      */
-    private fun directTarget(address: String): Pair<Conversation, String> {
-        val handle = imessageHandle(address)
-        val convos = _state.value.conversations
-        convos.firstOrNull { c -> !c.isGroup && c.participants.singleOrNull()?.let(::imessageHandle) == handle }
-            ?.let { return it to sendMethod() }
-        val service = convos.firstNotNullOfOrNull { c -> c.guid.substringBefore(";", "").ifEmpty { null } } ?: "any"
-        val convo = Conversation(
+    private fun constructedDirect(handle: String): Conversation {
+        val service = _state.value.conversations
+            .firstNotNullOfOrNull { c -> c.guid.substringBefore(";", "").ifEmpty { null } } ?: "any"
+        return Conversation(
             guid = "$service;-;$handle",
             displayName = "",
             participants = listOf(handle),
@@ -928,7 +929,6 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             lastDate = 0L,
             lastFromMe = true,
         )
-        return convo to "apple-script"
     }
 
     /** Normalizes a picked address to the E.164 (or lowercased email) handle that
@@ -993,11 +993,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /**
-     * Sends [text] to the single address in [addresses] — into the 1:1 the list
-     * already has, or a new one (see [directTarget]) — then opens that thread. It
-     * goes over `message/text`, not `chat/new`: on macOS 26 `chat/new` waits for
-     * its echo under an `iMessage;` guid that never matches, so it held every send
-     * for two minutes after delivering it (LP3-65). Groups are refused here: a
+     * Sends [text] to the single address in [addresses], then opens that thread.
+     * A 1:1 the list already has is sent into like any thread; otherwise `chat/new`
+     * starts it — over the Private API when it's live, since the AppleScript path
+     * holds the reply for two minutes on macOS 26 after the text has gone out
+     * (LP3-65; see [BlueBubblesApi.newChat]). Groups are refused here: a
      * BlueBubbles client can't create a brand-new group — that has to start on the
      * Mac (LP3-60). The new-message screen already won't offer it; this is the
      * backstop.
@@ -1031,9 +1031,17 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         _state.update { it.copy(sendingNew = true, newDraft = null, message = "Sending…") }
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                val (target, method) = directTarget(addrs.single())
-                sendAcrossRooms(target.guid, sendTargets(target, method)) { g ->
-                    client.send(g, body, newTempGuid(), method)
+                val handle = imessageHandle(addrs.single())
+                val listed = listedDirect(handle)
+                val target = if (listed != null) {
+                    val method = sendMethod()
+                    sendAcrossRooms(listed.guid, sendTargets(listed, method)) { g ->
+                        client.send(g, body, newTempGuid(), method)
+                    }
+                    listed
+                } else {
+                    val guid = client.newChat(handle, body, sendMethod())
+                    constructedDirect(handle).copy(guid = guid, guids = listOf(guid))
                 }
                 if (seq != newSendSeq) {
                     // Left the screen mid-send: it went out, so just surface it in the list.
