@@ -61,7 +61,7 @@ data class UiState(
     val contactList: List<Contact> = emptyList(), // searchable recipients for a new message
     val groupList: List<Conversation> = emptyList(), // named group chats, searchable on New Message
     val composingNew: Boolean = false,         // the "New message" compose screen is open
-    val sendingNew: Boolean = false,           // a new-message send (chat/new) is in flight
+    val sendingNew: Boolean = false,           // a New Message send is in flight
     val newDraft: Draft? = null,               // text of a failed new-message send, to restore
     val privateApi: Boolean = false,           // server's Private API live → tapbacks available
     val typingChatGuid: String? = null,        // chat whose other party is currently typing
@@ -857,12 +857,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }.getOrNull()
 
     /**
-     * Sends a picked image as the first message of a *new* 1:1. There's no chat
-     * guid yet, so we construct the canonical BlueBubbles 1:1 guid
-     * (`iMessage;-;<handle>`) — sending an attachment to it creates the chat
-     * server-side — then drop into the thread and refresh the list. The address is
-     * normalized to the E.164 handle iMessage keys its guids by (`newChat`'s
-     * AppleScript resolves loose addresses for text, but a constructed guid can't).
+     * Sends a picked image to [address] from New Message — into the 1:1 the list
+     * already has, or the chat.db one under a constructed guid (see
+     * [constructedDirect]) — then drops into the thread and refreshes the list.
      */
     fun sendNewImage(address: String, uri: Uri) {
         val addr = address.trim()
@@ -871,20 +868,19 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch(Dispatchers.IO) {
             val client = api ?: return@launch
             val img = readPickedImage(uri) ?: return@launch
+            // A chat the list doesn't have goes to its constructed guid, which the
+            // Private API resolves as long as chat.db has the chat; a never-texted
+            // address fails with a message rather than starting one (only text can,
+            // via chat/new).
             val handle = imessageHandle(addr)
-            val guid = "iMessage;-;$handle"
+            val target = listedDirect(handle) ?: constructedDirect(handle)
+            val method = sendMethod()
             try {
-                client.sendAttachment(guid, img.bytes, img.name, img.mime, newTempGuid(), sendMethod())
-                messageCache.remove(guid)
-                val convo = Conversation(
-                    guid = guid,
-                    displayName = "",
-                    participants = listOf(handle),
-                    isGroup = false,
-                    lastText = "[Photo]",
-                    lastDate = System.currentTimeMillis(),
-                    lastFromMe = true,
-                )
+                sendAcrossRooms(target.guid, sendTargets(target, method)) { g ->
+                    client.sendAttachment(g, img.bytes, img.name, img.mime, newTempGuid(), method)
+                }
+                messageCache.remove(target.guid)
+                val convo = target.copy(lastText = "[Photo]", lastDate = System.currentTimeMillis(), lastFromMe = true)
                 _state.update { it.copy(message = null) }
                 open(convo)     // land in the new thread (fetch pulls the sent image)
                 deltaRefresh()  // and pull it into the conversation list
@@ -907,6 +903,32 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
                 !caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
         }
+    }
+
+    /** The 1:1 with [handle] the conversation list already has, if any. */
+    private fun listedDirect(handle: String): Conversation? =
+        _state.value.conversations.firstOrNull { c ->
+            !c.isGroup && c.participants.singleOrNull()?.let(::imessageHandle) == handle
+        }
+
+    /**
+     * A 1:1 with [handle] the list doesn't have, under a constructed
+     * `<service>;-;<handle>` guid. The service prefix is read off the list's own
+     * guids rather than assumed: macOS 26 keys every chat `any;…` where older
+     * releases used `iMessage;…`.
+     */
+    private fun constructedDirect(handle: String): Conversation {
+        val service = _state.value.conversations
+            .firstNotNullOfOrNull { c -> c.guid.substringBefore(";", "").ifEmpty { null } } ?: "any"
+        return Conversation(
+            guid = "$service;-;$handle",
+            displayName = "",
+            participants = listOf(handle),
+            isGroup = false,
+            lastText = "",
+            lastDate = 0L,
+            lastFromMe = true,
+        )
     }
 
     /** Normalizes a picked address to the E.164 (or lowercased email) handle that
@@ -971,10 +993,14 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /**
-     * Starts a fresh 1:1 with [addresses] by sending [text], then opens it on the
-     * guid `newChat` returns. Groups are refused here: a BlueBubbles client can't
-     * create a brand-new group — that has to start on the Mac (LP3-60). The new-
-     * message screen already won't offer it; this is the backstop.
+     * Sends [text] to the single address in [addresses], then opens that thread.
+     * A 1:1 the list already has is sent into like any thread; otherwise `chat/new`
+     * starts it — over the Private API when it's live, since the AppleScript path
+     * holds the reply for two minutes on macOS 26 after the text has gone out
+     * (LP3-65; see [BlueBubblesApi.newChat]). Groups are refused here: a
+     * BlueBubbles client can't create a brand-new group — that has to start on the
+     * Mac (LP3-60). The new-message screen already won't offer it; this is the
+     * backstop.
      *
      * The new-message screen stays up until the server confirms: closing it up
      * front dropped the user on the list, which only shows `message` when empty, so
@@ -1005,7 +1031,18 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         _state.update { it.copy(sendingNew = true, newDraft = null, message = "Sending…") }
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                val guid = client.newChat(addrs, body)
+                val handle = imessageHandle(addrs.single())
+                val listed = listedDirect(handle)
+                val target = if (listed != null) {
+                    val method = sendMethod()
+                    sendAcrossRooms(listed.guid, sendTargets(listed, method)) { g ->
+                        client.send(g, body, newTempGuid(), method)
+                    }
+                    listed
+                } else {
+                    val guid = client.newChat(handle, body, sendMethod())
+                    constructedDirect(handle).copy(guid = guid, guids = listOf(guid))
+                }
                 if (seq != newSendSeq) {
                     // Left the screen mid-send: it went out, so just surface it in the list.
                     _state.update { it.copy(sendingNew = false) }
@@ -1013,16 +1050,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     return@launch
                 }
                 _state.update { it.copy(composingNew = false, sendingNew = false) }
-                messageCache.remove(guid)
-                val convo = Conversation(
-                    guid = guid,
-                    displayName = "",
-                    participants = addrs,
-                    isGroup = false,
-                    lastText = body,
-                    lastDate = System.currentTimeMillis(),
-                    lastFromMe = true,
-                )
+                messageCache.remove(target.guid)
+                val convo = target.copy(lastText = body, lastDate = System.currentTimeMillis(), lastFromMe = true)
                 _state.update { it.copy(message = null) }
                 open(convo)     // land the user in the new thread
                 deltaRefresh()  // and pull it into the conversation list

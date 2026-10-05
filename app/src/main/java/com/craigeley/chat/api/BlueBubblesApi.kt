@@ -451,31 +451,26 @@ class BlueBubblesApi(private val baseUrl: String, private val password: String) 
     }
 
     /**
-     * `POST /api/v1/chat/new` — starts a new chat by sending its first message.
-     * macOS Big Sur+ requires a message (AppleScript can't create an empty chat),
-     * so this both creates the chat and sends. Returns the new chat's guid.
+     * `POST /api/v1/chat/new` — starts a 1:1 with [address] by sending [text] as its
+     * first message (macOS Big Sur+ can't create an empty chat) and returns the chat's
+     * guid. Only for a 1:1 the conversation list doesn't have: a listed one is sent
+     * into with [send].
      *
-     * A single address goes over **AppleScript** (rock-solid, no Private API
-     * needed). Two or more addresses form a **group**, which AppleScript can't do
-     * reliably on modern macOS — that path requires `method:"private-api"`, so the
-     * caller must gate group creation on the server's Private API being live. The
-     * server assigns the group its own guid (`any;+;<hex>`, style 43), unguessable
-     * client-side, so callers must use the returned guid rather than construct one.
-     *
-     * The server holds the response until the first message lands in chat.db (it
-     * waits up to 30s on top of the helper's own round trip), so this gets a longer
-     * read timeout than [request]'s default — at 20s a slow group create timed out
-     * client-side. Failures carry the server's own reason (e.g. "Failed to create
-     * chat via the Private API!") rather than a bare status code.
+     * Use [method] `private-api` whenever the Private API is live. That path has the
+     * helper create the chat and send, then finds the chat by the *message's* guid, so
+     * it holds up on macOS 26, where every chat guid is `any;…`. The `apple-script`
+     * path can't: it sends to a constructed `iMessage;-;<address>`, then waits for an
+     * echo under that guid which never comes, and holds the reply for the server's
+     * 120s timeout after the message has gone out (LP3-65). It's kept only for a
+     * server without the Private API.
      */
-    fun newChat(addresses: List<String>, text: String, service: String = "iMessage"): String {
-        val isGroup = addresses.size > 1
+    fun newChat(address: String, text: String, method: String): String {
         val body = JSONObject()
-            .put("addresses", JSONArray().apply { addresses.forEach { put(it) } })
+            .put("addresses", JSONArray().put(address))
             .put("message", text)
-            .put("service", service)
-            .put("method", if (isGroup) "private-api" else "apple-script")
-        val (code, resp) = request("POST", "/api/v1/chat/new", body, readTimeoutMs = 90_000)
+            .put("service", "iMessage")
+            .put("method", method)
+        val (code, resp) = request("POST", "/api/v1/chat/new", body, readTimeoutMs = 60_000)
         if (code !in 200..299) {
             throw ApiException(code, serverError(resp) ?: "new chat failed ($code)")
         }
