@@ -61,7 +61,7 @@ data class UiState(
     val contactList: List<Contact> = emptyList(), // searchable recipients for a new message
     val groupList: List<Conversation> = emptyList(), // named group chats, searchable on New Message
     val composingNew: Boolean = false,         // the "New message" compose screen is open
-    val sendingNew: Boolean = false,           // a new-message send (chat/new) is in flight
+    val sendingNew: Boolean = false,           // a New Message send is in flight
     val newDraft: Draft? = null,               // text of a failed new-message send, to restore
     val privateApi: Boolean = false,           // server's Private API live → tapbacks available
     val typingChatGuid: String? = null,        // chat whose other party is currently typing
@@ -857,12 +857,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }.getOrNull()
 
     /**
-     * Sends a picked image as the first message of a *new* 1:1. There's no chat
-     * guid yet, so we construct the canonical BlueBubbles 1:1 guid
-     * (`iMessage;-;<handle>`) — sending an attachment to it creates the chat
-     * server-side — then drop into the thread and refresh the list. The address is
-     * normalized to the E.164 handle iMessage keys its guids by (`newChat`'s
-     * AppleScript resolves loose addresses for text, but a constructed guid can't).
+     * Sends a picked image as the first message to [address] from New Message —
+     * into the 1:1 the list already has, or a constructed one (see [directTarget])
+     * that the send creates server-side — then drops into the thread and refreshes
+     * the list.
      */
     fun sendNewImage(address: String, uri: Uri) {
         val addr = address.trim()
@@ -871,20 +869,13 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch(Dispatchers.IO) {
             val client = api ?: return@launch
             val img = readPickedImage(uri) ?: return@launch
-            val handle = imessageHandle(addr)
-            val guid = "iMessage;-;$handle"
+            val (target, method) = directTarget(addr)
             try {
-                client.sendAttachment(guid, img.bytes, img.name, img.mime, newTempGuid(), sendMethod())
-                messageCache.remove(guid)
-                val convo = Conversation(
-                    guid = guid,
-                    displayName = "",
-                    participants = listOf(handle),
-                    isGroup = false,
-                    lastText = "[Photo]",
-                    lastDate = System.currentTimeMillis(),
-                    lastFromMe = true,
-                )
+                sendAcrossRooms(target.guid, sendTargets(target, method)) { g ->
+                    client.sendAttachment(g, img.bytes, img.name, img.mime, newTempGuid(), method)
+                }
+                messageCache.remove(target.guid)
+                val convo = target.copy(lastText = "[Photo]", lastDate = System.currentTimeMillis(), lastFromMe = true)
                 _state.update { it.copy(message = null) }
                 open(convo)     // land in the new thread (fetch pulls the sent image)
                 deltaRefresh()  // and pull it into the conversation list
@@ -907,6 +898,37 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
                 !caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
         }
+    }
+
+    /**
+     * Where a New Message send to the single [address] goes, and by which method.
+     * The 1:1 the list already has is used as-is (its own guid, the usual method).
+     * Otherwise we construct the 1:1 guid `<service>;-;<handle>` and send by
+     * AppleScript, whose fallback script texts the handle and so creates the chat
+     * (the Private API can only send into a chat that already exists).
+     *
+     * The service prefix is read off the list's own guids rather than assumed:
+     * macOS 26 keys every chat `any;…` where older releases used `iMessage;…`. A
+     * mismatched prefix still delivers, but the server then waits for the echo in
+     * a chat that never appears and holds the reply until its 120s timeout — what
+     * left `chat/new` stuck on "Sending…" (LP3-65).
+     */
+    private fun directTarget(address: String): Pair<Conversation, String> {
+        val handle = imessageHandle(address)
+        val convos = _state.value.conversations
+        convos.firstOrNull { c -> !c.isGroup && c.participants.singleOrNull()?.let(::imessageHandle) == handle }
+            ?.let { return it to sendMethod() }
+        val service = convos.firstNotNullOfOrNull { c -> c.guid.substringBefore(";", "").ifEmpty { null } } ?: "any"
+        val convo = Conversation(
+            guid = "$service;-;$handle",
+            displayName = "",
+            participants = listOf(handle),
+            isGroup = false,
+            lastText = "",
+            lastDate = 0L,
+            lastFromMe = true,
+        )
+        return convo to "apple-script"
     }
 
     /** Normalizes a picked address to the E.164 (or lowercased email) handle that
@@ -971,10 +993,14 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /**
-     * Starts a fresh 1:1 with [addresses] by sending [text], then opens it on the
-     * guid `newChat` returns. Groups are refused here: a BlueBubbles client can't
-     * create a brand-new group — that has to start on the Mac (LP3-60). The new-
-     * message screen already won't offer it; this is the backstop.
+     * Sends [text] to the single address in [addresses] — into the 1:1 the list
+     * already has, or a new one (see [directTarget]) — then opens that thread. It
+     * goes over `message/text`, not `chat/new`: on macOS 26 `chat/new` waits for
+     * its echo under an `iMessage;` guid that never matches, so it held every send
+     * for two minutes after delivering it (LP3-65). Groups are refused here: a
+     * BlueBubbles client can't create a brand-new group — that has to start on the
+     * Mac (LP3-60). The new-message screen already won't offer it; this is the
+     * backstop.
      *
      * The new-message screen stays up until the server confirms: closing it up
      * front dropped the user on the list, which only shows `message` when empty, so
@@ -1005,7 +1031,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         _state.update { it.copy(sendingNew = true, newDraft = null, message = "Sending…") }
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                val guid = client.newChat(addrs, body)
+                val (target, method) = directTarget(addrs.single())
+                sendAcrossRooms(target.guid, sendTargets(target, method)) { g ->
+                    client.send(g, body, newTempGuid(), method)
+                }
                 if (seq != newSendSeq) {
                     // Left the screen mid-send: it went out, so just surface it in the list.
                     _state.update { it.copy(sendingNew = false) }
@@ -1013,16 +1042,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     return@launch
                 }
                 _state.update { it.copy(composingNew = false, sendingNew = false) }
-                messageCache.remove(guid)
-                val convo = Conversation(
-                    guid = guid,
-                    displayName = "",
-                    participants = addrs,
-                    isGroup = false,
-                    lastText = body,
-                    lastDate = System.currentTimeMillis(),
-                    lastFromMe = true,
-                )
+                messageCache.remove(target.guid)
+                val convo = target.copy(lastText = body, lastDate = System.currentTimeMillis(), lastFromMe = true)
                 _state.update { it.copy(message = null) }
                 open(convo)     // land the user in the new thread
                 deltaRefresh()  // and pull it into the conversation list

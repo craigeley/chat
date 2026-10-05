@@ -239,9 +239,7 @@ clears the password and returns to setup.
   `tempGuid`/`method` echo handling as `send`, same `sendTargets()` room selection);
   `downloadAttachment(guid,dest)`
   → `GET /attachment/:guid/download` (streams the raw bytes to a file, for the inline
-  image loader); `newChat(address,text)` →
-  `POST /chat/new` (starts a 1:1 by sending the first message — macOS Big Sur+
-  requires the message inline; returns the new chat guid); `contacts()` → `GET /contact`
+  image loader); `contacts()` → `GET /contact`
   flattened to (address,name) pairs. Message parsing lives in the **companion**
   (`parseMessage`, `messageText`, `messageEvent`) so the socket service decodes
   `new-message`/`updated-message` payloads with the same logic. `parseAttachments`
@@ -347,8 +345,9 @@ clears the password and returns to setup.
   session-lived per-conversation `messageCache` (now the *raw* list) so reopening a
   thread is instant (cached shown immediately, fresh fetch refreshes in the
   background; snapshotted on `closeThread`). Starts/stops
-  `SocketService`. `sendNewMessage(address,text)` starts a fresh 1:1 via `newChat`
-  then opens it; the searchable `contactList` (one `Contact` per address, built
+  `SocketService`. `sendNewMessage(address,text)` sends via `message/text` to the
+  listed 1:1 or a constructed `<service>;-;<handle>` guid (`directTarget`; not
+  `chat/new`, which hangs 120s on macOS 26 — LP3-65) then opens it; the searchable `contactList` (one `Contact` per address, built
   from `contacts()`) feeds the new-message picker. Screen routing derives from
   state: no password → setup; `composingNew` → new message; `open != null` →
   thread; else list.
@@ -463,14 +462,14 @@ clears the password and returns to setup.
   (the compose bar's "+" launches the system photo picker — no permission), seeds
   the cache, posts an optimistic bubble, then reconciles with the server echo. For a
   brand-new chat there's no guid yet, so `sendNewImage(address, uri)` constructs the
-  canonical 1:1 guid `iMessage;-;<handle>` (the address normalized to its E.164/email
-  handle by `imessageHandle` — a constructed guid can't lean on `newChat`'s loose
-  AppleScript address resolution), sends the attachment to it (which creates the
-  chat server-side), then opens the thread + refreshes.
+  1:1 guid via `directTarget` (the listed 1:1 if there is one, else
+  `<service>;-;<handle>` with the service prefix — `any` on macOS 26 — read off the
+  list's guids and the address normalized by `imessageHandle`), sends the attachment
+  to it (which creates the chat server-side), then opens the thread + refreshes.
 - **Screens** (`ui/`) — `SetupScreen` (password entry), `ConversationsScreen`
   (list, tap title → settings, Refresh, **New**), `NewMessageScreen` (a "To" field
   that searches the contact index by name/number/email or takes a raw address,
-  then a compose bar; sends via `newChat` and opens the thread), `ThreadScreen`
+  then a compose bar; sends via `sendNewMessage` and opens the thread), `ThreadScreen`
   (messages — text + inline images — and a compose bar with a back chevron; `linkify`
   turns http/https URLs in a body into tappable `LinkAnnotation.Url` links),
   `SettingsScreen` (server host + refresh

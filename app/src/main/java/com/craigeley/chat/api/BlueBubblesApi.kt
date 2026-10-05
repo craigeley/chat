@@ -451,39 +451,6 @@ class BlueBubblesApi(private val baseUrl: String, private val password: String) 
     }
 
     /**
-     * `POST /api/v1/chat/new` — starts a new chat by sending its first message.
-     * macOS Big Sur+ requires a message (AppleScript can't create an empty chat),
-     * so this both creates the chat and sends. Returns the new chat's guid.
-     *
-     * A single address goes over **AppleScript** (rock-solid, no Private API
-     * needed). Two or more addresses form a **group**, which AppleScript can't do
-     * reliably on modern macOS — that path requires `method:"private-api"`, so the
-     * caller must gate group creation on the server's Private API being live. The
-     * server assigns the group its own guid (`any;+;<hex>`, style 43), unguessable
-     * client-side, so callers must use the returned guid rather than construct one.
-     *
-     * The server holds the response until the first message lands in chat.db (it
-     * waits up to 30s on top of the helper's own round trip), so this gets a longer
-     * read timeout than [request]'s default — at 20s a slow group create timed out
-     * client-side. Failures carry the server's own reason (e.g. "Failed to create
-     * chat via the Private API!") rather than a bare status code.
-     */
-    fun newChat(addresses: List<String>, text: String, service: String = "iMessage"): String {
-        val isGroup = addresses.size > 1
-        val body = JSONObject()
-            .put("addresses", JSONArray().apply { addresses.forEach { put(it) } })
-            .put("message", text)
-            .put("service", service)
-            .put("method", if (isGroup) "private-api" else "apple-script")
-        val (code, resp) = request("POST", "/api/v1/chat/new", body, readTimeoutMs = 90_000)
-        if (code !in 200..299) {
-            throw ApiException(code, serverError(resp) ?: "new chat failed ($code)")
-        }
-        val guid = dataObject(resp)?.optString("guid")
-        return guid?.takeIf { it.isNotBlank() } ?: throw IOException("new chat: no guid returned")
-    }
-
-    /**
      * Every named group chat on the Mac — not just the recently active ones the
      * sweep sees — so New Message can find a group by name (LP3-63). Pages
      * `chat/query` (a few MB across ~2.5k chats, so callers fetch it once and
@@ -617,7 +584,6 @@ class BlueBubblesApi(private val baseUrl: String, private val password: String) 
         path: String,
         body: JSONObject?,
         extraQuery: String? = null,
-        readTimeoutMs: Int = 20_000,
     ): Pair<Int, String> {
         val url = buildString {
             append(baseUrl).append(path)
@@ -627,7 +593,7 @@ class BlueBubblesApi(private val baseUrl: String, private val password: String) 
         val conn = (URL(url).openConnection() as HttpURLConnection).apply {
             requestMethod = method
             connectTimeout = 15_000
-            readTimeout = readTimeoutMs
+            readTimeout = 20_000
             setRequestProperty("Accept", "application/json")
             if (body != null) {
                 doOutput = true
@@ -639,7 +605,7 @@ class BlueBubblesApi(private val baseUrl: String, private val password: String) 
         // the Tailscale tunnel would pay a fresh TLS handshake (LP3-22).
         // Connect up front so a connect timeout surfaces as a plain IOException: a
         // SocketTimeoutException out of here means the request went out and the
-        // reply timed out, which chat/new reads as "may still send".
+        // reply timed out, which a New Message send reads as "may still send".
         try {
             conn.connect()
         } catch (e: SocketTimeoutException) {

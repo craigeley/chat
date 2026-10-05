@@ -48,7 +48,8 @@ import com.craigeley.chat.ui.theme.ChatType
  * chosen recipient becomes a removable chip. Only a 1:1 can be started here: a
  * BlueBubbles client can't create a brand-new group (LP3-60), so a second chip
  * swaps the compose bar for a note to start the group on the Mac. Type the first
- * message and send; that creates the chat (`chat/new`) and drops into the thread.
+ * message and send; that starts the 1:1 (or reuses the listed one) and drops into
+ * the thread.
  */
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
