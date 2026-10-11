@@ -392,8 +392,11 @@ clears the password and returns to setup.
       on a VPN that's the only way it *can* be noticed.
     - **Catch-up on connect.** The server only pushes what happens while the
       socket is open, so every `EVENT_CONNECT` replays `messagesSince(cursor)`
-      (`POST /message/query`, `after:`, `with: chats,handle,attachment`, newest
-      100) through `deliver()`, oldest first. The cursor is `Store.lastSeenDate`
+      (`POST /message/query`, `after:`, `with: chats,handle,attachment`, pages of
+      100 up to 3 pages, newest kept) through `deliver()`, oldest first. A failed
+      catch-up parks the cursor before the gap and retries on a 30s→5min backoff
+      while the socket is up; notified guids persist (`Store.notifiedGuids`, 256)
+      so a replay after a service restart never re-buzzes. The cursor is `Store.lastSeenDate`
       — the newest `dateCreated` seen by any path (socket event, replay, or the
       ViewModel's sweep, which seeds it), persisted so a boot-time start knows
       where the last session left off. Replayed messages already **read

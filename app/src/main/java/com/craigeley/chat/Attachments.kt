@@ -12,6 +12,8 @@ import com.craigeley.chat.api.BlueBubblesApi
 import java.io.File
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 /**
  * Inline-image loader for message attachments — deliberately dependency-free (no
@@ -26,9 +28,16 @@ object Attachments {
      *  and downsampling at decode time is what keeps memory in check. */
     private const val MAX_DIM = 1080
 
-    /** Decoded images held in memory; bitmaps are already downsampled, so a modest
-     *  count keeps the working set tiny while smoothing re-scroll. */
-    private val memory = object : LruCache<String, ImageBitmap>(16) {}
+    /** Byte-bounded decoded images keep large photos from dominating memory —
+     *  ~10 full 1080px photos, so re-scrolling a thread rarely re-decodes. */
+    private const val MEMORY_BYTES = 48 * 1024 * 1024
+    private const val DISK_BYTES = 128L * 1024 * 1024
+    private val memory = object : LruCache<String, ImageBitmap>(MEMORY_BYTES) {
+        override fun sizeOf(key: String, value: ImageBitmap): Int = value.width * value.height * 4
+    }
+    // Fixed stripes bound lock bookkeeping; identical guids always share a lock.
+    private val downloads = Array(32) { Mutex() }
+    private val diskLock = Any()
 
     /**
      * The decoded image for [attachment], or null if it isn't an image, the
@@ -38,18 +47,30 @@ object Attachments {
         if (!attachment.isImage) return null
         memory.get(attachment.guid)?.let { return it }
         return withContext(Dispatchers.IO) {
-            val file = File(context.cacheDir, "att_" + safeName(attachment.guid))
-            if (!file.exists() || file.length() == 0L) {
-                // maxDim asks the server to downscale before sending — we'd decode
-                // down to MAX_DIM anyway, so the extra bytes were pure waste (LP3-19).
-                runCatching { api.downloadAttachment(attachment.guid, file, maxDim = MAX_DIM) }.getOrElse {
-                    file.delete() // don't leave a truncated file to be trusted next time
-                    return@withContext null
+            downloads[(attachment.guid.hashCode() and Int.MAX_VALUE) % downloads.size].withLock {
+                memory.get(attachment.guid)?.let { return@withLock it }
+                val file = File(context.cacheDir, "att_" + safeName(attachment.guid))
+                if (!file.exists() || file.length() == 0L) {
+                    val pending = File.createTempFile("attachment_", ".pending", context.cacheDir)
+                    try {
+                        api.downloadAttachment(attachment.guid, pending, maxDim = MAX_DIM)
+                        synchronized(diskLock) { check(pending.renameTo(file)) }
+                    } catch (e: Exception) {
+                        return@withLock null
+                    } finally {
+                        pending.delete()
+                    }
+                }
+                synchronized(diskLock) {
+                    val image = decode(file)?.asImageBitmap()
+                    if (image == null) file.delete() else {
+                        file.setLastModified(System.currentTimeMillis())
+                        memory.put(attachment.guid, image)
+                    }
+                    trimDisk(context, file)
+                    image
                 }
             }
-            val image = decode(file)?.asImageBitmap() ?: return@withContext null
-            memory.put(attachment.guid, image)
-            image
         }
     }
 
@@ -60,7 +81,30 @@ object Attachments {
      * guid; the real server attachment downloads separately once the echo lands.
      */
     fun cacheLocal(context: Context, guid: String, bytes: ByteArray) {
-        runCatching { File(context.cacheDir, "att_" + safeName(guid)).writeBytes(bytes) }
+        synchronized(diskLock) {
+            runCatching {
+                val file = File(context.cacheDir, "att_" + safeName(guid))
+                val pending = File.createTempFile("attachment_", ".pending", context.cacheDir)
+                try {
+                    pending.writeBytes(bytes)
+                    check(pending.renameTo(file))
+                } finally { pending.delete() }
+                trimDisk(context, file)
+            }
+        }
+    }
+
+    /** Caller holds diskLock; never evict the file currently being decoded/written. */
+    private fun trimDisk(context: Context, keep: File) {
+        val files = context.cacheDir.listFiles { f -> f.isFile && f.name.startsWith("att_") }
+            ?.sortedBy { it.lastModified() } ?: return
+        var bytes = files.sumOf { it.length() }
+        for (file in files) {
+            if (bytes <= DISK_BYTES) break
+            if (file == keep) continue
+            val size = file.length()
+            if (file.delete()) bytes -= size
+        }
     }
 
     /** Decode the file with `inSampleSize` chosen to bring it under [MAX_DIM],

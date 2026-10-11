@@ -19,6 +19,9 @@ private const val CHAT_PAGE = 1000
 /** Carries the HTTP status so the ViewModel can treat 401/403 as a bad password. */
 class ApiException(val code: Int, message: String) : IOException(message) {
     val isAuthError: Boolean get() = code == 401 || code == 403
+    val isRoomLookupError: Boolean get() = !isAuthError &&
+        (message.orEmpty().contains("-1728") ||
+            message.orEmpty().contains("Can't get chat id", ignoreCase = true))
 }
 
 /**
@@ -207,21 +210,35 @@ class BlueBubblesApi(private val baseUrl: String, private val password: String) 
      * The socket's catch-up query: every message created after [after] (epoch
      * millis), oldest first, decoded exactly like a socket event ([messageEvent] —
      * embedded chats for routing, `handle` for the sender name in a notification)
-     * so `SocketService` can replay a gap through its normal delivery path. Newest
-     * [limit] only; a longer gap than that is the ViewModel's delta refresh's job.
+     * so `SocketService` can replay a gap through its normal delivery path. Pages of
+     * [limit] are fetched until the gap is recovered or [maxPages] is reached — a
+     * gap longer than that (a phone off for days) keeps only its newest messages;
+     * the rest is the ViewModel's delta refresh's job, and a capped fetch keeps one
+     * reconnect on a weak cellular link from pulling an unbounded backlog.
      */
-    fun messagesSince(after: Long, limit: Int = 100): List<IncomingMessage> {
-        val body = JSONObject()
-            .put("limit", limit)
-            .put("offset", 0)
-            .put("with", JSONArray().put("chats").put("handle").put("attachment"))
-            .put("sort", "DESC")
-            .put("after", after)
-        val respText = requestChecked("POST", "/api/v1/message/query", body, what = "message/query")
-        val data = JSONObject(respText).optJSONArray("data") ?: JSONArray()
-        return (0 until data.length())
-            .mapNotNull { messageEvent(data.getJSONObject(it), isNew = true) }
-            .sortedBy { it.message.date }
+    fun messagesSince(after: Long, limit: Int = 100, maxPages: Int = 3): List<IncomingMessage> {
+        require(limit > 0 && maxPages > 0)
+        val messages = LinkedHashMap<String, IncomingMessage>()
+        var offset = 0
+        // Fetch the complete gap before the caller commits its cursor. Keep the
+        // timestamp boundary inclusive; the caller filters already-seen dates.
+        while (true) {
+            val body = JSONObject()
+                .put("limit", limit)
+                .put("offset", offset)
+                .put("with", JSONArray().put("chats").put("handle").put("attachment"))
+                .put("sort", "DESC")
+                .put("after", (after - 1).coerceAtLeast(0))
+            val response = requestChecked("POST", "/api/v1/message/query", body, what = "message/query")
+            val data = JSONObject(response).optJSONArray("data") ?: JSONArray()
+            for (i in 0 until data.length()) {
+                messageEvent(data.getJSONObject(i), isNew = true)?.let { messages[it.message.guid] = it }
+            }
+            if (data.length() < limit) break
+            offset += data.length()
+            if (offset >= limit * maxPages) break
+        }
+        return messages.values.sortedBy { it.message.date }
     }
 
     /** `GET /api/v1/chat/:guid/message` — messages in one conversation, newest first. */

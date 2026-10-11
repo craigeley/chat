@@ -76,6 +76,17 @@ class SocketService : Service() {
     // same network (capability churn) doesn't bounce a healthy connection.
     @Volatile private var connectedOn: Network? = null
     private var callbackRegistered = false
+    private val cursorLock = Any()
+    private var catchingUp = false
+    private var cursorGap = false
+    private var deferredCursor = 0L
+    // A failed catch-up leaves the cursor parked before its gap (live events only
+    // raise deferredCursor), so it's retried on a backoff while the socket stays up
+    // rather than waiting for the next reconnect. Main-thread only.
+    private var catchUpRetryMs = CATCH_UP_RETRY_MIN_MS
+    private val catchUpRetry = Runnable { if (socket?.connected() == true) catchUp() }
+    // Loaded from Store in onCreate; persisted on every add.
+    private val alertedGuids = LinkedHashSet<String>()
 
     private val defaultCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) {
@@ -124,6 +135,7 @@ class SocketService : Service() {
      *  retry timer) and wait for a callback to bring one back. */
     private fun goIdle(why: String) {
         main.removeCallbacks(reconnectRunnable)
+        main.removeCallbacks(catchUpRetry)
         Log.d(TAG, "$why — going idle")
         socket?.disconnect()
         setStatus(STATUS_OFFLINE)
@@ -140,6 +152,7 @@ class SocketService : Service() {
             ServiceInfo.FOREGROUND_SERVICE_TYPE_REMOTE_MESSAGING,
         )
         connectivity = getSystemService(ConnectivityManager::class.java)
+        alertedGuids.addAll(Store.notifiedGuids(this))
         if (!setUp()) { stopSelf(); return }
         // Both callbacks fire onAvailable straight away for what's already up, which
         // is what performs the initial connect — so a service started with no
@@ -184,6 +197,11 @@ class SocketService : Service() {
             connectedOn = currentNetwork
             SocketBus.connected.value = true
             setStatus(STATUS_CONNECTED)
+            main.post {
+                // A fresh connect retries straight away; start the backoff over.
+                main.removeCallbacks(catchUpRetry)
+                catchUpRetryMs = CATCH_UP_RETRY_MIN_MS
+            }
             catchUp()
         })
         s.on(Socket.EVENT_DISCONNECT, Emitter.Listener {
@@ -241,15 +259,38 @@ class SocketService : Service() {
      * nothing to catch up on: the ViewModel's first sweep seeds it.
      */
     private fun catchUp() {
-        val since = Store.lastSeenDate(this)
-        if (since <= 0L) return
         val client = api ?: return
+        val since = synchronized(cursorLock) {
+            if (catchingUp) return
+            val cursor = Store.lastSeenDate(this)
+            if (cursor <= 0L) return
+            catchingUp = true
+            cursorGap = true
+            deferredCursor = cursor
+            cursor
+        }
         catchUpExecutor.execute {
-            val missed = runCatching { client.messagesSince(since) }
-                .getOrElse { Log.w(TAG, "catch-up failed", it); return@execute }
-                .filter { it.message.date > since } // belt and braces on the server's `after`
-            Log.d(TAG, "catch-up: ${missed.size} message(s) since $since")
-            for (m in missed) deliver(m, replay = true)
+            try {
+                val missed = client.messagesSince(since).filter { it.message.date > since }
+                Log.d(TAG, "catch-up: ${missed.size} message(s) since $since")
+                for (m in missed) deliver(m, replay = true)
+                synchronized(cursorLock) {
+                    Store.advanceLastSeen(this, deferredCursor)
+                    cursorGap = false
+                    catchingUp = false
+                }
+                main.post { catchUpRetryMs = CATCH_UP_RETRY_MIN_MS }
+            } catch (e: Exception) {
+                // Do not allow a newer live event to move the cursor beyond an
+                // incompletely fetched gap; retry it on a backoff instead.
+                synchronized(cursorLock) { catchingUp = false }
+                Log.w(TAG, "catch-up failed — retrying in ${catchUpRetryMs / 1000}s", e)
+                main.post {
+                    main.removeCallbacks(catchUpRetry)
+                    main.postDelayed(catchUpRetry, catchUpRetryMs)
+                    catchUpRetryMs = (catchUpRetryMs * 2).coerceAtMost(CATCH_UP_RETRY_MAX_MS)
+                }
+            }
         }
     }
 
@@ -287,11 +328,19 @@ class SocketService : Service() {
      */
     private fun deliver(incoming: IncomingMessage, replay: Boolean) {
         val m = incoming.message
-        Store.advanceLastSeen(this, m.date)
+        synchronized(cursorLock) {
+            if (catchingUp || cursorGap) deferredCursor = maxOf(deferredCursor, m.date)
+            else Store.advanceLastSeen(this, m.date)
+        }
         SocketBus.incoming.tryEmit(incoming)
         val alert = incoming.isNew && !m.fromMe && !m.isGroupEvent && !AppForeground.active &&
             (!replay || m.dateRead == 0L)
         if (!alert) return
+        synchronized(alertedGuids) {
+            if (!alertedGuids.add(m.guid)) return
+            if (alertedGuids.size > MAX_NOTIFIED) alertedGuids.remove(alertedGuids.first())
+            Store.setNotifiedGuids(this, alertedGuids)
+        }
         // Prefer an explicit (group) chat name; otherwise resolve the sender's
         // address to a contact name from the persisted index, falling back to
         // the raw address. Read fresh so it reflects the latest address book.
@@ -321,6 +370,7 @@ class SocketService : Service() {
             runCatching { connectivity.unregisterNetworkCallback(physicalCallback) }
         }
         main.removeCallbacks(reconnectRunnable)
+        main.removeCallbacks(catchUpRetry)
         catchUpExecutor.shutdownNow()
         socket?.disconnect()
         socket?.off()
@@ -336,5 +386,8 @@ class SocketService : Service() {
         private const val STATUS_RECONNECTING = "Reconnecting…"
         private const val STATUS_OFFLINE = "Offline — waiting for a network"
         private const val RECONNECT_COALESCE_MS = 300L
+        private const val CATCH_UP_RETRY_MIN_MS = 30_000L
+        private const val CATCH_UP_RETRY_MAX_MS = 5 * 60_000L
+        private const val MAX_NOTIFIED = 256
     }
 }

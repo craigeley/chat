@@ -22,6 +22,7 @@ object Store {
     private const val KEY_PRIVATE_API = "private_api" // server's Private API live?
     private const val KEY_LAST_SEEN = "last_seen_date" // newest message date seen (catch-up cursor)
     private const val KEY_GROUPS = "named_groups"  // named group chats for New Message search, JSON
+    private const val KEY_NOTIFIED = "notified_guids" // recently notified message guids, newline-joined
 
     /** The configured BlueBubbles Server URL, or null if setup hasn't run yet. */
     fun baseUrl(context: Context): String? =
@@ -86,10 +87,23 @@ object Store {
      */
     fun lastSeenDate(context: Context): Long = prefs(context).getLong(KEY_LAST_SEEN, 0L)
 
+    @Synchronized
     fun advanceLastSeen(context: Context, date: Long) {
         if (date <= 0L) return
         val prefs = prefs(context)
         if (date > prefs.getLong(KEY_LAST_SEEN, 0L)) prefs.edit().putLong(KEY_LAST_SEEN, date).apply()
+    }
+
+    /**
+     * Guids `SocketService` has already notified for, oldest first. Persisted so a
+     * replay after a service restart (it's START_STICKY and restarts often on a
+     * flaky link) can't buzz again for a message that already alerted.
+     */
+    fun notifiedGuids(context: Context): List<String> =
+        prefs(context).getString(KEY_NOTIFIED, null)?.split('\n')?.filter { it.isNotEmpty() } ?: emptyList()
+
+    fun setNotifiedGuids(context: Context, guids: Collection<String>) {
+        prefs(context).edit().putString(KEY_NOTIFIED, guids.joinToString("\n")).apply()
     }
 
     /**
