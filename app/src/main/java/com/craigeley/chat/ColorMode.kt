@@ -43,13 +43,10 @@ object ColorMode {
         lift(context)
     }
 
-    /** Back to grayscale, immediately. Hiding the flip is the *viewer's* job: it
-     *  calls this only once it has faded the photo out to pure black — black is
-     *  identical in color and mono, so the flip can't be seen (see
-     *  ImageViewerScreen's close sequence). Trying to hide it here with a timer
-     *  instead never worked: whichever side of the dismissal frame the flip
-     *  landed on, either the full-screen photo or its inline thumbnail was
-     *  visibly desaturated. */
+    /** Back to grayscale, immediately. The viewer calls this as it closes, in
+     *  the same frame it dismisses; the write lands asynchronously, so the
+     *  thread may show in color for a frame or two — accepted for an instant
+     *  dismissal (see ImageViewerScreen). */
     fun release(context: Context) {
         held = false
         restore(context)

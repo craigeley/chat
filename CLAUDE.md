@@ -54,8 +54,8 @@ on the tailnet is far lighter, and gets ordering right because it owns the sort.
   pattern: that unmounted the `LazyColumn`, so dismissing lost the scroll
   position and re-loaded every inline image — the disorienting-return bug).
   Same loader/caches as the inline render so it appears instantly. Pinch to zoom (capped at 4×, matching the 1080px decode cap), drag
-  to pan while zoomed, double-tap to toggle zoom at the tapped point; a single
-  tap or Back closes. Pure black, no chrome. The image row's own
+  to pan while zoomed; a single tap or Back closes instantly. (Double-tap zoom
+  was removed 2026-10-10: listening for it held every single tap ~300ms.) Pure black, no chrome. The image row's own
   `combinedClickable` re-offers the long-press so tapbacks on images still work
   (the column's handler would otherwise be shadowed by the image's), and a tap
   while the tapback picker is open dismisses the picker instead of opening the
@@ -66,14 +66,13 @@ on the tailnet is far lighter, and gets ordering right because it owns the sort.
   setting; `ColorMode` (`ColorMode.kt`) flips
   `accessibility_display_daltonizer_enabled` off on `acquire` (viewer enters
   composition, via `DisposableEffect`) and restores the saved mode on `release` —
-  a SurfaceFlinger color-matrix change, so both flips are instant. **Hiding the
-  restore is the viewer's close sequence**, not a timer (timers were tried and
-  failed both ways — whichever side of the dismissal frame the flip landed on,
-  either the full-screen photo or its inline thumbnail visibly desaturated):
-  tap/Back sets `closing`, the photo fades out to the black background (120ms),
-  `release` fires while the screen is pure black — black is identical in color
-  and mono, the one moment the flip can't be seen — a ~70ms hold lets the async
-  settings write land, then `onClose()` reveals the thread, already B&W.
+  a SurfaceFlinger color-matrix change, so both flips are instant. **Dismissal is
+  instant (2026-10-10):** tap/Back calls `release` then `onClose()` in the same
+  frame, so the thread may show in color for a frame or two while the async
+  settings write lands — accepted for speed. (The earlier close sequence — fade
+  the photo to black over 120ms, restore while the screen is pure black, hold
+  ~70ms, then reveal — hid the flip completely but, with the double-tap wait,
+  took ~500ms and read as a missed tap. Timers alone never hid it either.)
   `onAppHidden` restores immediately, no fade (another app's colors are showing).
   `MainActivity.onStop/onStart` → `onAppHidden`/`onAppVisible` keep the rest of
   the phone B&W if the app is backgrounded mid-view and re-lift on return.
