@@ -19,8 +19,11 @@ import com.craigeley.chat.socket.SocketBus
 import com.craigeley.chat.socket.SocketService
 import java.io.File
 import java.net.SocketTimeoutException
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.ensureActive
+import kotlin.coroutines.coroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -274,9 +277,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             }
             sweepRows = rows
             lastLoadAt = System.currentTimeMillis()
-            // Everything in the sweep has been seen here — the socket's catch-up
-            // replay only needs to start after it.
-            rows.maxOfOrNull { it.msg.date }?.let { Store.advanceLastSeen(app, it) }
+            // Seed first-run state only. Later sweeps must not advance past a
+            // gap that the service still needs to replay for notifications.
+            if (Store.lastSeenDate(app) == 0L) {
+                rows.maxOfOrNull { it.msg.date }?.let { Store.advanceLastSeen(app, it) }
+            }
             val convos = client.deriveConversations(rows).sortedByDescending { it.lastDate }
                 // Honor unreads already cleared on this device (see clearedUnread).
                 .map { c ->
@@ -353,6 +358,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     // ---- One thread -------------------------------------------------------
 
+    @Synchronized
     fun open(conversation: Conversation) {
         val cached = messageCache[conversation.guid]
         openRaw = cached ?: emptyList()
@@ -376,6 +382,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         threadJob?.cancel()
         threadJob = viewModelScope.launch(Dispatchers.IO) {
             val client = api ?: return@launch
+            val baseline = synchronized(this@ChatViewModel) { openRaw }
             try {
                 // Raw — reactions included; merged across a forked group's sibling
                 // rooms (usually just one guid) and re-sorted by date in foldReactions.
@@ -385,18 +392,26 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 val results = conversation.guids.map { g -> runCatching { client.messages(g) } }
                 val msgs = results.mapNotNull { it.getOrNull() }.flatten().distinctBy { it.guid }
                 if (msgs.isEmpty()) results.firstNotNullOfOrNull { it.exceptionOrNull() }?.let { throw it }
-                messageCache[conversation.guid] = msgs
-                if (_state.value.open?.guid == conversation.guid) {
-                    openRaw = msgs
-                    _state.update { it.copy(messages = foldReactions(msgs), threadLoading = false) }
+                coroutineContext.ensureActive()
+                synchronized(this@ChatViewModel) {
+                    if (_state.value.open?.guid == conversation.guid) {
+                        // Keep socket updates and optimistic sends made during the fetch,
+                        // while allowing fresh REST receipts to replace unchanged rows.
+                        coroutineContext.ensureActive()
+                        openRaw = mergeFetchedThread(msgs, baseline, openRaw)
+                        messageCache[conversation.guid] = openRaw
+                        _state.update { it.copy(messages = foldReactions(openRaw), threadLoading = false) }
+                    }
                 }
             } catch (t: Throwable) {
+                if (t is CancellationException) throw t
                 _state.update { if (it.open?.guid == conversation.guid) it.copy(threadLoading = false) else it }
                 handleError(t)
             }
         }
     }
 
+    @Synchronized
     fun closeThread() {
         // Snapshot the raw list (incl. live updates) so reopening is instant.
         _state.value.open?.let {
@@ -414,6 +429,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
      * forked group spans several rooms, so every guid is deleted. Optimistic: the row
      * disappears immediately; if any room fails we re-pull the list so it reappears.
      */
+    @Synchronized
     fun deleteConversation(conversation: Conversation) {
         if (!_state.value.privateApi) {
             _state.update { it.copy(message = "Deleting needs the Private API") }
@@ -445,6 +461,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
      * folded view — but only if [convoGuid] is still the open thread, so a late
      * send/echo can't clobber a thread the user has since navigated away from.
      */
+    @Synchronized
     private fun updateOpenThread(convoGuid: String, transform: (List<ChatMessage>) -> List<ChatMessage>) {
         // Membership, not equality: an incoming message may arrive on any of a forked
         // group's sibling rooms, all of which belong to the same open thread.
@@ -527,6 +544,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 lastGoodRoom[convoGuid] = guid
                 return result
             } catch (t: Throwable) {
+                // Only an explicit pre-send room lookup failure permits another
+                // attempt. A timeout may mean the first send already delivered.
+                val lookupFailed = t is ApiException && t.isRoomLookupError
+                if (!lookupFailed) throw t
                 last = t
             }
         }
@@ -573,7 +594,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             reconcileEcho(convo.guid, tempGuid, sent)
             bumpConversation(convo.guid, sent.previewText, sent.date, fromMe = true)
         } catch (t: Throwable) {
-            rollbackOptimistic(convo.guid, tempGuid, errorMessage)
+            val notice = if (t is SocketTimeoutException) "No confirmation — the message may have sent" else errorMessage
+            rollbackOptimistic(convo.guid, tempGuid, notice)
         }
     }
 
@@ -1288,13 +1310,13 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         // server echoes back, since the optimistic bubble still carries it as its guid.
         // Without the latter the echo (real guid) would render as a second row until the
         // HTTP send call returns and swaps the temp guid in.
-        val idx = list.indexOfFirst { it.guid == m.guid || (m.tempGuid != null && it.guid == m.tempGuid) }
-        return if (idx >= 0) list.toMutableList().also { it[idx] = m } else list + m
+        return mergeMessage(list, m)
     }
 
     /** Looks up a message by guid in whatever's cached (the open thread, or any
      *  previously-opened thread), so a live tapback can describe its target. Null
      *  when the target isn't loaded — the preview then reads "a message". */
+    @Synchronized
     private fun cachedMessage(guid: String): ChatMessage? {
         openRaw.firstOrNull { it.guid == guid }?.let { return it }
         for (list in messageCache.values) list.firstOrNull { it.guid == guid }?.let { return it }
